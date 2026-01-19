@@ -17,3 +17,9 @@ aiofiles==23.2.1
 
 # Development
 python-dotenv==1.0.0
+
+# Google Vertex AI SDK
+google-cloud-aiplatform>=1.45.0
+
+# Neo4j Graph Database
+neo4j~=5.28.0

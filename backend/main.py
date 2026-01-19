@@ -28,6 +28,13 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    from backend.services import neo4j_service
+    neo4j_service.connect()
+
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +54,10 @@ app.include_router(search_router)
 frontend_path = Path(__file__).parent.parent / "frontend"
 if frontend_path.exists():
     app.mount("/static", StaticFiles(directory=str(frontend_path / "static")), name="static")
+
+# Serve uploaded files
+if settings.UPLOAD_DIR.exists():
+    app.mount("/files", StaticFiles(directory=str(settings.UPLOAD_DIR)), name="files")
 
 
 @app.get("/api/health")

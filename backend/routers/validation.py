@@ -1,6 +1,7 @@
 """
 Validation Router - OCR validation operations.
 """
+import logging
 from fastapi import APIRouter, HTTPException
 
 from backend.models import (
@@ -9,7 +10,14 @@ from backend.models import (
     OCRValidationRequest,
     OCRStatus,
 )
-from backend.services import db, ocr_service, similarity_service
+from backend.services import (
+    db,
+    ocr_service,
+    similarity_service,
+    graph_service,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/validation", tags=["validation"])
 
@@ -24,14 +32,19 @@ async def approve_biodata(biodata_id: str):
     if not biodata:
         raise HTTPException(status_code=404, detail="Biodata not found")
 
-    updated = await db.update(biodata_id, {
-        "ocr_status": OCRStatus.APPROVED.value,
-        "is_approved": True
-    })
+    updated = await db.update(
+        biodata_id, {"ocr_status": OCRStatus.APPROVED.value, "is_approved": True}
+    )
 
     if updated:
         # Index for similarity search
         await similarity_service.index_biodata(updated)
+
+        # Sync with Neo4j graph
+        try:
+            await graph_service.add_biodata(updated)
+        except Exception as e:
+            logger.warning(f"Failed to sync biodata to Neo4j: {e}")
 
     return updated
 
@@ -46,13 +59,18 @@ async def reject_biodata(biodata_id: str):
     if not biodata:
         raise HTTPException(status_code=404, detail="Biodata not found")
 
-    updated = await db.update(biodata_id, {
-        "ocr_status": OCRStatus.REJECTED.value,
-        "is_approved": False
-    })
+    updated = await db.update(
+        biodata_id, {"ocr_status": OCRStatus.REJECTED.value, "is_approved": False}
+    )
 
     # Remove from similarity index
     await similarity_service.remove_from_index(biodata_id)
+
+    # Remove from Neo4j graph
+    try:
+        await graph_service.remove_biodata(biodata_id)
+    except Exception as e:
+        logger.warning(f"Failed to remove biodata from Neo4j: {e}")
 
     return updated
 
@@ -77,6 +95,12 @@ async def edit_and_approve(biodata_id: str, update: BiodataUpdate):
         # Re-index with corrected data
         await similarity_service.index_biodata(updated)
 
+        # Sync with Neo4j graph
+        try:
+            await graph_service.add_biodata(updated)
+        except Exception as e:
+            logger.warning(f"Failed to sync biodata to Neo4j: {e}")
+
     return updated
 
 
@@ -92,8 +116,7 @@ async def rerun_ocr(biodata_id: str):
 
     if not biodata.file_path:
         raise HTTPException(
-            status_code=400,
-            detail="No file associated with this biodata"
+            status_code=400, detail="No file associated with this biodata"
         )
 
     # Mark as processing
@@ -110,7 +133,7 @@ async def rerun_ocr(biodata_id: str):
         "ocr_status": status.value,
         "ocr_confidence": confidence,
         "raw_ocr_text": raw_text,
-        "is_approved": False  # Needs re-approval after re-OCR
+        "is_approved": False,  # Needs re-approval after re-OCR
     }
     updated = await db.update(biodata_id, update_data)
 
@@ -118,7 +141,7 @@ async def rerun_ocr(biodata_id: str):
 
 
 @router.post("/auto-approve-all")
-async def auto_approve_all(min_confidence: float = 0.7):
+async def auto_approve_all(min_confidence: float = 0.35):
     """
     Auto-approve all completed biodatas with confidence above threshold.
 
@@ -135,17 +158,24 @@ async def auto_approve_all(min_confidence: float = 0.7):
             and biodata.ocr_confidence
             and biodata.ocr_confidence >= min_confidence
         ):
-            await db.update(biodata.id, {
-                "ocr_status": OCRStatus.APPROVED.value,
-                "is_approved": True
-            })
+            await db.update(
+                biodata.id,
+                {"ocr_status": OCRStatus.APPROVED.value, "is_approved": True},
+            )
             await similarity_service.index_biodata(biodata)
+
+            # Sync with Neo4j graph
+            try:
+                await graph_service.add_biodata(biodata)
+            except Exception as e:
+                logger.warning(f"Failed to sync biodata {biodata.id} to Neo4j: {e}")
+
             approved_count += 1
 
     return {
         "message": f"Auto-approved {approved_count} biodatas",
         "approved_count": approved_count,
-        "min_confidence": min_confidence
+        "min_confidence": min_confidence,
     }
 
 
@@ -164,8 +194,7 @@ async def validate_action(request: OCRValidationRequest):
     elif action == "edit":
         if not request.updated_data:
             raise HTTPException(
-                status_code=400,
-                detail="updated_data required for edit action"
+                status_code=400, detail="updated_data required for edit action"
             )
         return await edit_and_approve(request.biodata_id, request.updated_data)
     elif action == "re-ocr":
@@ -173,5 +202,5 @@ async def validate_action(request: OCRValidationRequest):
     else:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid action: {action}. Supported: approve, reject, edit, re-ocr"
+            detail=f"Invalid action: {action}. Supported: approve, reject, edit, re-ocr",
         )

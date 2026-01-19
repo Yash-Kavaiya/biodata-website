@@ -13,7 +13,10 @@ from backend.models import (
     BiodataInDB,
     OCRStatus,
 )
-from backend.services import db, storage_service, similarity_service
+from backend.services import db, storage_service, graph_service, similarity_service
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/biodata", tags=["biodata"])
 
@@ -97,6 +100,12 @@ async def create_biodata(biodata: BiodataCreate):
     # Index for similarity search
     await similarity_service.index_biodata(saved)
 
+    # Sync with Neo4j graph
+    try:
+        await graph_service.add_biodata(saved)
+    except Exception as e:
+        logger.warning(f"Failed to sync biodata to Neo4j: {e}")
+
     return saved
 
 
@@ -113,6 +122,12 @@ async def update_biodata(biodata_id: str, update: BiodataUpdate):
     if updated:
         # Re-index for similarity search
         await similarity_service.index_biodata(updated)
+
+        # Sync with Neo4j graph
+        try:
+            await graph_service.add_biodata(updated)
+        except Exception as e:
+            logger.warning(f"Failed to sync biodata to Neo4j: {e}")
 
     return updated
 
@@ -135,6 +150,12 @@ async def delete_biodata(biodata_id: str):
     deleted = await db.delete(biodata_id)
     if not deleted:
         raise HTTPException(status_code=500, detail="Failed to delete biodata")
+
+    # Remove from Neo4j graph
+    try:
+        await graph_service.remove_biodata(biodata_id)
+    except Exception as e:
+        logger.warning(f"Failed to remove biodata from Neo4j: {e}")
 
     return {"message": "Biodata deleted successfully", "id": biodata_id}
 
@@ -172,3 +193,60 @@ async def get_ocr_text(biodata_id: str):
         "ocr_confidence": biodata.ocr_confidence,
         "ocr_status": biodata.ocr_status
     }
+
+
+@router.post("/sync/neo4j")
+async def sync_all_to_neo4j():
+    """
+    Sync all existing biodatas to Neo4j graph database.
+    Use this to populate Neo4j with data uploaded before graph integration.
+    """
+    # Initialize schema
+    await graph_service.initialize_schema()
+
+    # Get all biodatas
+    biodatas, total = await db.get_all(page=1, page_size=1000)
+
+    synced = 0
+    failed = 0
+    errors = []
+
+    for biodata in biodatas:
+        try:
+            success = await graph_service.add_biodata(biodata)
+            if success:
+                synced += 1
+            else:
+                failed += 1
+                errors.append({"id": biodata.id, "error": "add_biodata returned False"})
+        except Exception as e:
+            failed += 1
+            errors.append({"id": biodata.id, "error": str(e)[:100]})
+
+    return {
+        "total": total,
+        "synced": synced,
+        "failed": failed,
+        "errors": errors[:10],  # First 10 errors
+        "message": f"Synced {synced}/{total} biodatas to Neo4j"
+    }
+
+
+@router.get("/graph/stats")
+async def get_graph_stats():
+    """Get Neo4j graph database statistics."""
+    stats = await graph_service.get_stats()
+    return stats
+
+
+@router.get("/graph/data")
+async def get_graph_data(
+    biodata_id: Optional[str] = Query(None, description="Center graph on specific biodata"),
+    limit: int = Query(50, ge=1, le=200, description="Max nodes to return")
+):
+    """
+    Get graph data for visualization.
+    Returns nodes and edges in D3.js compatible format.
+    """
+    data = await graph_service.get_graph_data(biodata_id=biodata_id, limit=limit)
+    return data

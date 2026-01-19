@@ -1,448 +1,67 @@
 /**
- * Biodata Management System - Frontend Application
+ * Biodata Management System - AngularJS Application
+ * Wedding Theme Edition
  */
 
-const API_BASE = '/api';
+// Create the AngularJS module
+var app = angular.module('biodataApp', []);
 
-// State management
-const state = {
-    currentPage: 'upload',
-    biodatas: [],
-    pendingValidation: [],
-    searchResults: [],
-    uploadQueue: []
-};
+// API Base URL
+var API_BASE = '/api';
 
-// DOM Elements
-const elements = {
-    navLinks: document.querySelectorAll('.nav-links a'),
-    pageSections: document.querySelectorAll('.page-section'),
-    uploadArea: document.getElementById('uploadArea'),
-    fileInput: document.getElementById('fileInput'),
-    uploadQueue: document.getElementById('uploadQueue'),
-    biodataTable: document.getElementById('biodataTable'),
-    validationList: document.getElementById('validationList'),
-    searchResults: document.getElementById('searchResults'),
-    toastContainer: document.getElementById('toastContainer')
-};
+// ==============================================
+// MAIN CONTROLLER
+// ==============================================
+app.controller('MainController', ['$scope', '$http', '$timeout', function ($scope, $http, $timeout) {
 
-// Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    initNavigation();
-    initUpload();
-    initSearch();
-    loadInitialData();
-});
+    // ==================== STATE ====================
+    $scope.currentPage = 'upload';
+    $scope.isLoading = false;
+    $scope.isDragOver = false;
 
-// Navigation
-function initNavigation() {
-    document.querySelectorAll('.nav-links a').forEach(link => {
-        link.addEventListener('click', (e) => {
-            e.preventDefault();
-            const page = link.dataset.page;
-            navigateTo(page);
-        });
-    });
-}
+    // Models
+    $scope.availableModels = [];
+    $scope.selectedModel = null;
+    $scope.defaultModel = null;
 
-function navigateTo(page) {
-    state.currentPage = page;
+    // Upload
+    $scope.uploadQueue = [];
+    $scope.uploadType = 'files';  // 'files' or 'folder'
+    $scope.batchJob = null;
+    $scope.batchPollInterval = null;
 
-    // Update nav links
-    document.querySelectorAll('.nav-links a').forEach(link => {
-        link.classList.toggle('active', link.dataset.page === page);
-    });
+    // Biodatas
+    $scope.biodatas = [];
+    $scope.totalBiodatas = 0;
 
-    // Update page sections
-    document.querySelectorAll('.page-section').forEach(section => {
-        section.classList.toggle('active', section.id === `${page}Page`);
-    });
+    // Validation
+    $scope.pendingValidation = [];
+    $scope.autoApproveConfidence = 0.35;
 
-    // Load data for page
-    switch(page) {
-        case 'upload':
-            break;
-        case 'validation':
-            loadPendingValidation();
-            break;
-        case 'biodatas':
-            loadBiodatas();
-            break;
-        case 'search':
-            loadSearchStats();
-            break;
-    }
-}
+    // Search
+    $scope.searchTab = 'preferences';
+    $scope.searchPrefs = {};
+    $scope.searchResults = [];
+    $scope.searchStats = null;
+    $scope.isSearching = false;
+    $scope.hasSearched = false;
 
-// Upload functionality
-function initUpload() {
-    const uploadArea = document.getElementById('uploadArea');
-    const fileInput = document.getElementById('fileInput');
+    // Graph
+    $scope.graphData = null;
+    $scope.graphStats = null;
+    $scope.network = null;
 
-    if (!uploadArea || !fileInput) return;
+    // Modals
+    $scope.showBiodataModal = false;
+    $scope.showEditModal = false;
+    $scope.selectedBiodata = null;
+    $scope.editingBiodata = null;
 
-    // Click to upload
-    uploadArea.addEventListener('click', () => fileInput.click());
+    // Toasts
+    $scope.toasts = [];
 
-    // Drag and drop
-    uploadArea.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        uploadArea.classList.add('drag-over');
-    });
-
-    uploadArea.addEventListener('dragleave', () => {
-        uploadArea.classList.remove('drag-over');
-    });
-
-    uploadArea.addEventListener('drop', (e) => {
-        e.preventDefault();
-        uploadArea.classList.remove('drag-over');
-        const files = Array.from(e.dataTransfer.files);
-        handleFiles(files);
-    });
-
-    // File input change
-    fileInput.addEventListener('change', (e) => {
-        const files = Array.from(e.target.files);
-        handleFiles(files);
-        fileInput.value = '';
-    });
-}
-
-async function handleFiles(files) {
-    const validFiles = files.filter(f => {
-        const ext = f.name.split('.').pop().toLowerCase();
-        return ['pdf', 'png', 'jpg', 'jpeg'].includes(ext);
-    });
-
-    if (validFiles.length === 0) {
-        showToast('No valid files selected. Allowed: PDF, PNG, JPG', 'error');
-        return;
-    }
-
-    // Add to queue
-    validFiles.forEach(file => {
-        const id = Date.now() + Math.random().toString(36).substr(2, 9);
-        state.uploadQueue.push({
-            id,
-            file,
-            name: file.name,
-            status: 'pending',
-            progress: 0
-        });
-    });
-
-    renderUploadQueue();
-
-    // Process uploads
-    if (validFiles.length === 1) {
-        await uploadSingleFile(state.uploadQueue[state.uploadQueue.length - 1]);
-    } else {
-        await uploadBulkFiles(validFiles);
-    }
-}
-
-async function uploadSingleFile(queueItem) {
-    queueItem.status = 'uploading';
-    renderUploadQueue();
-
-    const formData = new FormData();
-    formData.append('file', queueItem.file);
-
-    try {
-        const response = await fetch(`${API_BASE}/upload/single`, {
-            method: 'POST',
-            body: formData
-        });
-
-        const result = await response.json();
-
-        if (response.ok) {
-            queueItem.status = 'completed';
-            queueItem.result = result;
-            showToast(`${queueItem.name} uploaded successfully!`, 'success');
-        } else {
-            queueItem.status = 'failed';
-            queueItem.error = result.detail || 'Upload failed';
-            showToast(`Failed to upload ${queueItem.name}`, 'error');
-        }
-    } catch (error) {
-        queueItem.status = 'failed';
-        queueItem.error = error.message;
-        showToast(`Error uploading ${queueItem.name}`, 'error');
-    }
-
-    renderUploadQueue();
-}
-
-async function uploadBulkFiles(files) {
-    const formData = new FormData();
-    files.forEach(file => formData.append('files', file));
-
-    // Update all queue items to uploading
-    state.uploadQueue.forEach(item => {
-        if (item.status === 'pending') {
-            item.status = 'uploading';
-        }
-    });
-    renderUploadQueue();
-
-    try {
-        const response = await fetch(`${API_BASE}/upload/bulk`, {
-            method: 'POST',
-            body: formData
-        });
-
-        const result = await response.json();
-
-        if (response.ok) {
-            // Update queue items with results
-            result.uploads.forEach((upload, i) => {
-                const queueItem = state.uploadQueue.find(q => q.name === upload.filename);
-                if (queueItem) {
-                    queueItem.status = upload.status === 'failed' ? 'failed' : 'completed';
-                    queueItem.result = upload;
-                }
-            });
-
-            showToast(`Uploaded ${result.successful}/${result.total} files`,
-                result.failed > 0 ? 'error' : 'success');
-        } else {
-            state.uploadQueue.forEach(item => {
-                if (item.status === 'uploading') {
-                    item.status = 'failed';
-                }
-            });
-            showToast('Bulk upload failed', 'error');
-        }
-    } catch (error) {
-        state.uploadQueue.forEach(item => {
-            if (item.status === 'uploading') {
-                item.status = 'failed';
-                item.error = error.message;
-            }
-        });
-        showToast('Error during bulk upload', 'error');
-    }
-
-    renderUploadQueue();
-}
-
-function renderUploadQueue() {
-    const container = document.getElementById('uploadQueue');
-    if (!container) return;
-
-    if (state.uploadQueue.length === 0) {
-        container.innerHTML = '';
-        return;
-    }
-
-    container.innerHTML = state.uploadQueue.map(item => `
-        <div class="upload-item">
-            <div class="upload-item-info">
-                <div class="upload-item-name">${item.name}</div>
-                <div class="upload-item-status">
-                    ${item.status === 'pending' ? 'Waiting...' : ''}
-                    ${item.status === 'uploading' ? 'Uploading...' : ''}
-                    ${item.status === 'completed' ? `Completed - ${item.result?.message || 'Success'}` : ''}
-                    ${item.status === 'failed' ? `Failed - ${item.error || 'Error'}` : ''}
-                </div>
-            </div>
-            <span class="badge badge-${item.status}">${item.status}</span>
-        </div>
-    `).join('');
-}
-
-// Biodata Table
-async function loadBiodatas(page = 1) {
-    const container = document.getElementById('biodataTable');
-    if (!container) return;
-
-    container.innerHTML = '<div class="empty-state"><div class="spinner"></div></div>';
-
-    try {
-        const response = await fetch(`${API_BASE}/biodata?page=${page}&page_size=20`);
-        const data = await response.json();
-
-        state.biodatas = data.items;
-        renderBiodataTable(data);
-    } catch (error) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-text">Failed to load biodatas</div>
-        </div>`;
-    }
-}
-
-function renderBiodataTable(data) {
-    const container = document.getElementById('biodataTable');
-    if (!container) return;
-
-    if (data.items.length === 0) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-icon">📋</div>
-            <div class="empty-state-text">No biodatas found</div>
-            <p>Upload some biodata files to get started</p>
-        </div>`;
-        return;
-    }
-
-    container.innerHTML = `
-        <div class="table-container">
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Name</th>
-                        <th>Age</th>
-                        <th>Gender</th>
-                        <th>Education</th>
-                        <th>Location</th>
-                        <th>Status</th>
-                        <th>Confidence</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${data.items.map(biodata => `
-                        <tr>
-                            <td>${biodata.name || '-'}</td>
-                            <td>${biodata.age || '-'}</td>
-                            <td>${biodata.gender || '-'}</td>
-                            <td>${biodata.education || '-'}</td>
-                            <td>${biodata.current_city || biodata.state || '-'}</td>
-                            <td><span class="badge badge-${biodata.ocr_status}">${biodata.ocr_status}</span></td>
-                            <td>
-                                <div class="confidence-indicator">
-                                    <div class="confidence-bar">
-                                        <div class="confidence-fill ${getConfidenceClass(biodata.ocr_confidence)}"
-                                             style="width: ${(biodata.ocr_confidence || 0) * 100}%"></div>
-                                    </div>
-                                    <span>${Math.round((biodata.ocr_confidence || 0) * 100)}%</span>
-                                </div>
-                            </td>
-                            <td>
-                                <div class="btn-group">
-                                    <button class="btn btn-sm btn-secondary" onclick="viewBiodata('${biodata.id}')">View</button>
-                                    <button class="btn btn-sm btn-danger" onclick="deleteBiodata('${biodata.id}')">Delete</button>
-                                </div>
-                            </td>
-                        </tr>
-                    `).join('')}
-                </tbody>
-            </table>
-        </div>
-        <div style="margin-top: 1rem; text-align: center; color: var(--text-secondary);">
-            Showing ${data.items.length} of ${data.total} biodatas
-        </div>
-    `;
-}
-
-function getConfidenceClass(confidence) {
-    if (!confidence) return 'low';
-    if (confidence >= 0.7) return 'high';
-    if (confidence >= 0.4) return 'medium';
-    return 'low';
-}
-
-async function viewBiodata(id) {
-    try {
-        const response = await fetch(`${API_BASE}/biodata/${id}`);
-        const biodata = await response.json();
-        showBiodataModal(biodata);
-    } catch (error) {
-        showToast('Failed to load biodata details', 'error');
-    }
-}
-
-async function deleteBiodata(id) {
-    if (!confirm('Are you sure you want to delete this biodata?')) return;
-
-    try {
-        const response = await fetch(`${API_BASE}/biodata/${id}`, { method: 'DELETE' });
-        if (response.ok) {
-            showToast('Biodata deleted successfully', 'success');
-            loadBiodatas();
-        } else {
-            showToast('Failed to delete biodata', 'error');
-        }
-    } catch (error) {
-        showToast('Error deleting biodata', 'error');
-    }
-}
-
-// Validation
-async function loadPendingValidation() {
-    const container = document.getElementById('validationList');
-    if (!container) return;
-
-    container.innerHTML = '<div class="empty-state"><div class="spinner"></div></div>';
-
-    try {
-        const response = await fetch(`${API_BASE}/biodata/pending`);
-        const data = await response.json();
-
-        state.pendingValidation = data.items;
-        renderValidationList(data.items);
-    } catch (error) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-text">Failed to load pending validations</div>
-        </div>`;
-    }
-}
-
-function renderValidationList(items) {
-    const container = document.getElementById('validationList');
-    if (!container) return;
-
-    if (items.length === 0) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-icon">✅</div>
-            <div class="empty-state-text">No pending validations</div>
-            <p>All OCR results have been validated</p>
-        </div>`;
-        return;
-    }
-
-    container.innerHTML = items.map(biodata => `
-        <div class="validation-card">
-            <div class="validation-header">
-                <div>
-                    <strong>${biodata.name || 'Unknown'}</strong>
-                    <span class="badge badge-${biodata.ocr_status}" style="margin-left: 0.5rem;">${biodata.ocr_status}</span>
-                </div>
-                <div class="confidence-indicator">
-                    <span>Confidence:</span>
-                    <div class="confidence-bar">
-                        <div class="confidence-fill ${getConfidenceClass(biodata.ocr_confidence)}"
-                             style="width: ${(biodata.ocr_confidence || 0) * 100}%"></div>
-                    </div>
-                    <span>${Math.round((biodata.ocr_confidence || 0) * 100)}%</span>
-                </div>
-            </div>
-            <div class="validation-body">
-                <div class="form-row">
-                    ${renderValidationFields(biodata)}
-                </div>
-            </div>
-            <div class="validation-actions">
-                <button class="btn btn-success" onclick="approveValidation('${biodata.id}')">
-                    ✓ Approve
-                </button>
-                <button class="btn btn-warning" onclick="editValidation('${biodata.id}')">
-                    ✎ Edit & Approve
-                </button>
-                <button class="btn btn-secondary" onclick="rerunOCR('${biodata.id}')">
-                    ↻ Re-OCR
-                </button>
-                <button class="btn btn-danger" onclick="rejectValidation('${biodata.id}')">
-                    ✕ Reject
-                </button>
-            </div>
-        </div>
-    `).join('');
-}
-
-function renderValidationFields(biodata) {
-    const fields = [
+    // Field definitions
+    $scope.validationFields = [
         { key: 'name', label: 'Name' },
         { key: 'age', label: 'Age' },
         { key: 'gender', label: 'Gender' },
@@ -455,262 +74,21 @@ function renderValidationFields(biodata) {
         { key: 'contact_number', label: 'Contact' }
     ];
 
-    return fields.map(f => `
-        <div class="form-group">
-            <label class="form-label">${f.label}</label>
-            <input type="text" class="form-input" value="${biodata[f.key] || ''}"
-                   data-biodata-id="${biodata.id}" data-field="${f.key}" readonly>
-        </div>
-    `).join('');
-}
+    $scope.editFields = [
+        { key: 'name', label: 'Name' },
+        { key: 'age', label: 'Age', type: 'number' },
+        { key: 'gender', label: 'Gender', type: 'select', options: ['male', 'female', 'other'] },
+        { key: 'education', label: 'Education' },
+        { key: 'occupation', label: 'Occupation' },
+        { key: 'religion', label: 'Religion' },
+        { key: 'caste', label: 'Caste' },
+        { key: 'current_city', label: 'Current City' },
+        { key: 'state', label: 'State' },
+        { key: 'contact_number', label: 'Contact' },
+        { key: 'email', label: 'Email', type: 'email' }
+    ];
 
-async function approveValidation(id) {
-    try {
-        const response = await fetch(`${API_BASE}/validation/approve/${id}`, { method: 'POST' });
-        if (response.ok) {
-            showToast('Biodata approved successfully', 'success');
-            loadPendingValidation();
-        } else {
-            showToast('Failed to approve biodata', 'error');
-        }
-    } catch (error) {
-        showToast('Error approving biodata', 'error');
-    }
-}
-
-async function rejectValidation(id) {
-    if (!confirm('Are you sure you want to reject this biodata?')) return;
-
-    try {
-        const response = await fetch(`${API_BASE}/validation/reject/${id}`, { method: 'POST' });
-        if (response.ok) {
-            showToast('Biodata rejected', 'success');
-            loadPendingValidation();
-        } else {
-            showToast('Failed to reject biodata', 'error');
-        }
-    } catch (error) {
-        showToast('Error rejecting biodata', 'error');
-    }
-}
-
-async function rerunOCR(id) {
-    showToast('Re-running OCR...', 'success');
-
-    try {
-        const response = await fetch(`${API_BASE}/validation/re-ocr/${id}`, { method: 'POST' });
-        if (response.ok) {
-            showToast('OCR re-processed successfully', 'success');
-            loadPendingValidation();
-        } else {
-            showToast('Failed to re-run OCR', 'error');
-        }
-    } catch (error) {
-        showToast('Error re-running OCR', 'error');
-    }
-}
-
-async function editValidation(id) {
-    const biodata = state.pendingValidation.find(b => b.id === id);
-    if (!biodata) return;
-
-    showEditModal(biodata);
-}
-
-async function autoApproveAll() {
-    const confidence = document.getElementById('autoApproveConfidence')?.value || 0.7;
-
-    try {
-        const response = await fetch(`${API_BASE}/validation/auto-approve-all?min_confidence=${confidence}`, {
-            method: 'POST'
-        });
-        const result = await response.json();
-
-        showToast(`Auto-approved ${result.approved_count} biodatas`, 'success');
-        loadPendingValidation();
-    } catch (error) {
-        showToast('Error during auto-approve', 'error');
-    }
-}
-
-// Search
-function initSearch() {
-    const form = document.getElementById('searchForm');
-    if (!form) return;
-
-    form.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        await performSearch();
-    });
-}
-
-async function performSearch() {
-    const container = document.getElementById('searchResults');
-    if (!container) return;
-
-    container.innerHTML = '<div class="empty-state"><div class="spinner"></div></div>';
-
-    const formData = new FormData(document.getElementById('searchForm'));
-    const preferences = {
-        gender: formData.get('gender') || null,
-        min_age: formData.get('min_age') ? parseInt(formData.get('min_age')) : null,
-        max_age: formData.get('max_age') ? parseInt(formData.get('max_age')) : null,
-        religion: formData.get('religion') || null,
-        caste: formData.get('caste') || null,
-        education: formData.get('education') || null,
-        location: formData.get('location') || null
-    };
-
-    // Remove null values
-    Object.keys(preferences).forEach(key => {
-        if (preferences[key] === null) delete preferences[key];
-    });
-
-    try {
-        const response = await fetch(`${API_BASE}/search/preferences?limit=20`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(preferences)
-        });
-
-        const results = await response.json();
-        state.searchResults = results;
-        renderSearchResults(results);
-    } catch (error) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-text">Search failed</div>
-        </div>`;
-    }
-}
-
-function renderSearchResults(results) {
-    const container = document.getElementById('searchResults');
-    if (!container) return;
-
-    if (results.length === 0) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-icon">🔍</div>
-            <div class="empty-state-text">No matches found</div>
-            <p>Try adjusting your search criteria</p>
-        </div>`;
-        return;
-    }
-
-    container.innerHTML = `
-        <div class="match-grid">
-            ${results.map(match => `
-                <div class="match-card">
-                    <div class="match-card-header">
-                        <div class="match-score">${Math.round(match.similarity_score * 100)}%</div>
-                        <div class="match-score-label">Match Score</div>
-                    </div>
-                    <div class="match-card-body">
-                        <div class="match-detail">
-                            <span class="match-detail-label">Name</span>
-                            <span class="match-detail-value">${match.biodata.name || '-'}</span>
-                        </div>
-                        <div class="match-detail">
-                            <span class="match-detail-label">Age</span>
-                            <span class="match-detail-value">${match.biodata.age || '-'}</span>
-                        </div>
-                        <div class="match-detail">
-                            <span class="match-detail-label">Education</span>
-                            <span class="match-detail-value">${match.biodata.education || '-'}</span>
-                        </div>
-                        <div class="match-detail">
-                            <span class="match-detail-label">Occupation</span>
-                            <span class="match-detail-value">${match.biodata.occupation || '-'}</span>
-                        </div>
-                        <div class="match-detail">
-                            <span class="match-detail-label">Location</span>
-                            <span class="match-detail-value">${match.biodata.current_city || match.biodata.state || '-'}</span>
-                        </div>
-                        ${match.match_reasons.length > 0 ? `
-                            <div class="match-reasons">
-                                <div class="match-reasons-title">Match Reasons:</div>
-                                ${match.match_reasons.map(r => `
-                                    <div class="match-reason-item">✓ ${r}</div>
-                                `).join('')}
-                            </div>
-                        ` : ''}
-                        <button class="btn btn-primary btn-sm" style="margin-top: 1rem; width: 100%;"
-                                onclick="viewBiodata('${match.biodata.id}')">
-                            View Full Profile
-                        </button>
-                    </div>
-                </div>
-            `).join('')}
-        </div>
-    `;
-}
-
-async function loadSearchStats() {
-    try {
-        const response = await fetch(`${API_BASE}/search/stats`);
-        const stats = await response.json();
-
-        const container = document.getElementById('searchStats');
-        if (container) {
-            container.innerHTML = `
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.total_approved}</div>
-                        <div class="stat-label">Total Profiles</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.by_gender.male || 0}</div>
-                        <div class="stat-label">Male Profiles</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.by_gender.female || 0}</div>
-                        <div class="stat-label">Female Profiles</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-value">${stats.age_range.min || '-'} - ${stats.age_range.max || '-'}</div>
-                        <div class="stat-label">Age Range</div>
-                    </div>
-                </div>
-            `;
-        }
-    } catch (error) {
-        console.error('Failed to load search stats', error);
-    }
-}
-
-async function searchByUpload() {
-    const fileInput = document.getElementById('searchFileInput');
-    if (!fileInput || !fileInput.files.length) {
-        showToast('Please select a file first', 'error');
-        return;
-    }
-
-    const container = document.getElementById('searchResults');
-    container.innerHTML = '<div class="empty-state"><div class="spinner"></div><p>Processing file and finding matches...</p></div>';
-
-    const formData = new FormData();
-    formData.append('file', fileInput.files[0]);
-
-    try {
-        const response = await fetch(`${API_BASE}/search/by-upload?limit=20`, {
-            method: 'POST',
-            body: formData
-        });
-
-        const results = await response.json();
-        renderSearchResults(results);
-    } catch (error) {
-        container.innerHTML = `<div class="empty-state">
-            <div class="empty-state-text">Search failed</div>
-        </div>`;
-    }
-}
-
-// Modal
-function showBiodataModal(biodata) {
-    const modal = document.getElementById('biodataModal');
-    const content = document.getElementById('modalContent');
-
-    const fields = [
+    $scope.allFields = [
         { key: 'name', label: 'Name' },
         { key: 'age', label: 'Age' },
         { key: 'gender', label: 'Gender' },
@@ -747,133 +125,822 @@ function showBiodataModal(biodata) {
         { key: 'partner_preferences', label: 'Partner Preferences' }
     ];
 
-    content.innerHTML = `
-        <div style="margin-bottom: 1rem;">
-            <span class="badge badge-${biodata.ocr_status}">${biodata.ocr_status}</span>
-            <span style="margin-left: 1rem;">Confidence: ${Math.round((biodata.ocr_confidence || 0) * 100)}%</span>
-        </div>
-        <div class="form-row">
-            ${fields.map(f => `
-                <div class="validation-field" style="display: ${biodata[f.key] ? 'grid' : 'none'};">
-                    <span class="validation-field-label">${f.label}</span>
-                    <span class="validation-field-value">${biodata[f.key] || '-'}</span>
-                </div>
-            `).join('')}
-        </div>
-    `;
+    // ==================== INITIALIZATION ====================
+    $scope.init = function () {
+        $scope.loadAvailableModels();
+    };
 
-    modal.classList.add('active');
-}
+    // ==================== NAVIGATION ====================
+    $scope.navigateTo = function (page) {
+        $scope.currentPage = page;
 
-function showEditModal(biodata) {
-    const modal = document.getElementById('editModal');
-    const content = document.getElementById('editModalContent');
-
-    const fields = [
-        { key: 'name', label: 'Name' },
-        { key: 'age', label: 'Age', type: 'number' },
-        { key: 'gender', label: 'Gender', type: 'select', options: ['male', 'female', 'other'] },
-        { key: 'education', label: 'Education' },
-        { key: 'occupation', label: 'Occupation' },
-        { key: 'religion', label: 'Religion' },
-        { key: 'caste', label: 'Caste' },
-        { key: 'current_city', label: 'Current City' },
-        { key: 'state', label: 'State' },
-        { key: 'contact_number', label: 'Contact' },
-        { key: 'email', label: 'Email', type: 'email' }
-    ];
-
-    content.innerHTML = `
-        <form id="editForm" data-biodata-id="${biodata.id}">
-            <div class="form-row">
-                ${fields.map(f => `
-                    <div class="form-group">
-                        <label class="form-label">${f.label}</label>
-                        ${f.type === 'select' ? `
-                            <select class="form-select" name="${f.key}">
-                                <option value="">Select...</option>
-                                ${f.options.map(o => `
-                                    <option value="${o}" ${biodata[f.key] === o ? 'selected' : ''}>${o}</option>
-                                `).join('')}
-                            </select>
-                        ` : `
-                            <input type="${f.type || 'text'}" class="form-input" name="${f.key}"
-                                   value="${biodata[f.key] || ''}">
-                        `}
-                    </div>
-                `).join('')}
-            </div>
-        </form>
-    `;
-
-    modal.classList.add('active');
-}
-
-async function saveEditAndApprove() {
-    const form = document.getElementById('editForm');
-    const id = form.dataset.biodataId;
-    const formData = new FormData(form);
-
-    const updateData = {};
-    formData.forEach((value, key) => {
-        if (value) {
-            updateData[key] = key === 'age' ? parseInt(value) : value;
+        switch (page) {
+            case 'validation':
+                $scope.loadPendingValidation();
+                break;
+            case 'biodatas':
+                $scope.loadBiodatas();
+                break;
+            case 'search':
+                $scope.loadSearchStats();
+                break;
+            case 'graph':
+                $scope.loadGraphData();
+                break;
         }
-    });
+    };
 
-    try {
-        const response = await fetch(`${API_BASE}/validation/edit/${id}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(updateData)
+    // ==================== TOAST ====================
+    $scope.showToast = function (message, type) {
+        type = type || 'success';
+        var toast = { message: message, type: type };
+        $scope.toasts.push(toast);
+
+        $timeout(function () {
+            var index = $scope.toasts.indexOf(toast);
+            if (index > -1) {
+                $scope.toasts.splice(index, 1);
+            }
+        }, 3000);
+    };
+
+    // ==================== MODELS ====================
+    $scope.loadAvailableModels = function () {
+        $http.get(API_BASE + '/upload/models')
+            .then(function (response) {
+                $scope.availableModels = response.data.models;
+                $scope.defaultModel = response.data.default;
+                $scope.selectedModel = response.data.default;
+            })
+            .catch(function (error) {
+                console.error('Failed to load models:', error);
+                $scope.availableModels = [
+                    'gemini-2.0-flash-001',
+                    'gemini-2.0-flash-lite-001',
+                    'gemini-2.5-pro-preview-06-05',
+                    'gemini-2.5-flash-preview-05-20'
+                ];
+                $scope.selectedModel = 'gemini-2.0-flash-001';
+                $scope.defaultModel = 'gemini-2.0-flash-001';
+            });
+    };
+
+    // ==================== UPLOAD ====================
+    $scope.triggerFileInput = function () {
+        document.getElementById('fileInput').click();
+    };
+
+    $scope.handleDragOver = function (event) {
+        event.preventDefault();
+        $scope.isDragOver = true;
+    };
+
+    $scope.handleDrop = function (event) {
+        event.preventDefault();
+        $scope.isDragOver = false;
+        var files = event.dataTransfer ? event.dataTransfer.files : [];
+        $scope.processFiles(files);
+    };
+
+    $scope.handleFileSelect = function (files) {
+        $scope.$apply(function () {
+            $scope.processFiles(files);
+        });
+    };
+
+    $scope.processFiles = function (files) {
+        var validFiles = [];
+        for (var i = 0; i < files.length; i++) {
+            var file = files[i];
+            var ext = file.name.split('.').pop().toLowerCase();
+            if (['pdf', 'png', 'jpg', 'jpeg'].indexOf(ext) !== -1) {
+                validFiles.push(file);
+            }
+        }
+
+        if (validFiles.length === 0) {
+            $scope.showToast('No valid files selected. Allowed: PDF, PNG, JPG', 'error');
+            return;
+        }
+
+        // Add to queue
+        validFiles.forEach(function (file) {
+            $scope.uploadQueue.push({
+                id: Date.now() + Math.random().toString(36).substr(2, 9),
+                file: file,
+                name: file.name,
+                status: 'pending',
+                message: ''
+            });
         });
 
-        if (response.ok) {
-            closeModal('editModal');
-            showToast('Biodata updated and approved', 'success');
-            loadPendingValidation();
+        // Process uploads
+        if (validFiles.length === 1) {
+            $scope.uploadSingleFile($scope.uploadQueue[$scope.uploadQueue.length - 1]);
         } else {
-            showToast('Failed to update biodata', 'error');
+            $scope.uploadBulkFiles(validFiles);
         }
-    } catch (error) {
-        showToast('Error updating biodata', 'error');
-    }
+    };
+
+    $scope.uploadSingleFile = function (queueItem) {
+        queueItem.status = 'uploading';
+
+        var formData = new FormData();
+        formData.append('file', queueItem.file);
+
+        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
+
+        $http.post(API_BASE + '/upload/single' + modelParam, formData, {
+            transformRequest: angular.identity,
+            headers: { 'Content-Type': undefined }
+        }).then(function (response) {
+            queueItem.status = 'completed';
+            queueItem.message = response.data.message;
+            $scope.showToast(queueItem.name + ' uploaded successfully!', 'success');
+        }).catch(function (error) {
+            queueItem.status = 'failed';
+            queueItem.error = error.data ? error.data.detail : 'Upload failed';
+            $scope.showToast('Failed to upload ' + queueItem.name, 'error');
+        });
+    };
+
+    $scope.uploadBulkFiles = function (files) {
+        var formData = new FormData();
+        files.forEach(function (file) {
+            formData.append('files', file);
+        });
+
+        $scope.uploadQueue.forEach(function (item) {
+            if (item.status === 'pending') {
+                item.status = 'uploading';
+            }
+        });
+
+        // Use async bulk endpoint for large batches (> 20 files)
+        var endpoint = files.length > 20 ? '/upload/async/bulk' : '/upload/bulk';
+        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
+
+        $http.post(API_BASE + endpoint + modelParam, formData, {
+            transformRequest: angular.identity,
+            headers: { 'Content-Type': undefined }
+        }).then(function (response) {
+            var result = response.data;
+
+            // Check if async response (has job_id)
+            if (result.job_id) {
+                $scope.showToast('Batch upload started: ' + result.queued + ' files queued', 'success');
+                $scope.startBatchPolling(result.job_id);
+                return;
+            }
+
+            // Sync response
+            result.uploads.forEach(function (upload) {
+                var queueItem = $scope.uploadQueue.find(function (q) {
+                    return q.name === upload.filename;
+                });
+                if (queueItem) {
+                    queueItem.status = upload.status === 'failed' ? 'failed' : 'completed';
+                    queueItem.message = upload.message;
+                }
+            });
+            $scope.showToast('Uploaded ' + result.successful + '/' + result.total + ' files',
+                result.failed > 0 ? 'error' : 'success');
+        }).catch(function (error) {
+            $scope.uploadQueue.forEach(function (item) {
+                if (item.status === 'uploading') {
+                    item.status = 'failed';
+                    item.error = 'Upload failed';
+                }
+            });
+            $scope.showToast('Bulk upload failed: ' + (error.data ? error.data.detail : 'Unknown error'), 'error');
+        });
+    };
+
+    // ==================== FOLDER UPLOAD ====================
+    $scope.triggerFolderInput = function () {
+        document.getElementById('folderInput').click();
+    };
+
+    $scope.handleFolderSelect = function (files) {
+        $scope.$apply(function () {
+            $scope.processFolderFiles(files);
+        });
+    };
+
+    $scope.processFolderFiles = function (files) {
+        var validFiles = [];
+        var skippedCount = 0;
+
+        for (var i = 0; i < files.length; i++) {
+            var file = files[i];
+            var ext = file.name.split('.').pop().toLowerCase();
+
+            // Skip hidden files and non-supported formats
+            if (file.name.startsWith('.')) {
+                skippedCount++;
+                continue;
+            }
+
+            if (['pdf', 'png', 'jpg', 'jpeg'].indexOf(ext) !== -1) {
+                validFiles.push(file);
+            } else {
+                skippedCount++;
+            }
+        }
+
+        if (validFiles.length === 0) {
+            $scope.showToast('No valid files found in folder. Supported: PDF, PNG, JPG', 'error');
+            return;
+        }
+
+        if (validFiles.length > 200) {
+            $scope.showToast('Too many files (' + validFiles.length + '). Maximum 200 files allowed.', 'error');
+            return;
+        }
+
+        $scope.showToast('Found ' + validFiles.length + ' valid files' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped)' : ''), 'success');
+
+        // Clear old queue
+        $scope.uploadQueue = [];
+
+        // Add to queue
+        validFiles.forEach(function (file) {
+            $scope.uploadQueue.push({
+                id: Date.now() + Math.random().toString(36).substr(2, 9),
+                file: file,
+                name: file.webkitRelativePath || file.name,
+                status: 'pending',
+                message: ''
+            });
+        });
+
+        // Upload using async bulk endpoint
+        $scope.uploadFolderAsync(validFiles);
+    };
+
+    $scope.uploadFolderAsync = function (files) {
+        var formData = new FormData();
+        files.forEach(function (file) {
+            formData.append('files', file);
+        });
+
+        $scope.uploadQueue.forEach(function (item) {
+            item.status = 'uploading';
+        });
+
+        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
+
+        $http.post(API_BASE + '/upload/async/bulk' + modelParam, formData, {
+            transformRequest: angular.identity,
+            headers: { 'Content-Type': undefined }
+        }).then(function (response) {
+            var result = response.data;
+            $scope.showToast('Folder upload started: ' + result.queued + ' files queued for processing', 'success');
+
+            // Show validation errors immediately
+            if (result.validation_errors > 0) {
+                $scope.showToast(result.validation_errors + ' files failed validation', 'error');
+            }
+
+            // Start polling for progress
+            $scope.startBatchPolling(result.job_id);
+        }).catch(function (error) {
+            $scope.uploadQueue.forEach(function (item) {
+                item.status = 'failed';
+                item.error = 'Upload failed';
+            });
+            $scope.showToast('Folder upload failed: ' + (error.data ? error.data.detail : 'Unknown error'), 'error');
+        });
+    };
+
+    // ==================== BATCH PROGRESS POLLING ====================
+    $scope.startBatchPolling = function (jobId) {
+        // Clear any existing poll
+        if ($scope.batchPollInterval) {
+            clearInterval($scope.batchPollInterval);
+        }
+
+        $scope.batchJob = {
+            id: jobId,
+            status: 'processing',
+            total: $scope.uploadQueue.length,
+            processed: 0,
+            successful: 0,
+            failed: 0,
+            progress_percent: 0,
+            errors: []
+        };
+
+        // Poll every 2 seconds
+        $scope.batchPollInterval = setInterval(function () {
+            $scope.pollBatchStatus(jobId);
+        }, 2000);
+
+        // Initial poll
+        $scope.pollBatchStatus(jobId);
+    };
+
+    $scope.pollBatchStatus = function (jobId) {
+        $http.get(API_BASE + '/upload/batch/' + jobId + '/status')
+            .then(function (response) {
+                $scope.batchJob = response.data;
+
+                // Update upload queue items based on progress
+                var processedCount = response.data.processed;
+                $scope.uploadQueue.forEach(function (item, index) {
+                    if (index < processedCount) {
+                        item.status = 'completed';
+                    }
+                });
+
+                // Check if complete
+                if (response.data.status !== 'processing') {
+                    $scope.stopBatchPolling();
+
+                    if (response.data.status === 'completed') {
+                        $scope.showToast('All ' + response.data.successful + ' files processed successfully!', 'success');
+                    } else if (response.data.status === 'partial') {
+                        $scope.showToast('Batch completed: ' + response.data.successful + ' success, ' + response.data.failed + ' failed', 'error');
+                    } else if (response.data.status === 'failed') {
+                        $scope.showToast('Batch failed: ' + response.data.failed + ' files failed', 'error');
+                    }
+
+                    // Mark failed items in queue
+                    if (response.data.errors && response.data.errors.length > 0) {
+                        response.data.errors.forEach(function (err) {
+                            var queueItem = $scope.uploadQueue.find(function (q) {
+                                return q.name.endsWith(err.filename) || q.name === err.filename;
+                            });
+                            if (queueItem) {
+                                queueItem.status = 'failed';
+                                queueItem.error = err.error;
+                            }
+                        });
+                    }
+                }
+            })
+            .catch(function (error) {
+                console.error('Failed to poll batch status:', error);
+                // Don't stop polling on transient errors
+            });
+    };
+
+    $scope.stopBatchPolling = function () {
+        if ($scope.batchPollInterval) {
+            clearInterval($scope.batchPollInterval);
+            $scope.batchPollInterval = null;
+        }
+    };
+
+    // ==================== BIODATAS ====================
+    $scope.loadBiodatas = function () {
+        $scope.isLoading = true;
+
+        $http.get(API_BASE + '/biodata?page=1&page_size=20')
+            .then(function (response) {
+                $scope.biodatas = response.data.items;
+                $scope.totalBiodatas = response.data.total;
+                $scope.isLoading = false;
+            })
+            .catch(function (error) {
+                $scope.isLoading = false;
+                $scope.showToast('Failed to load biodatas', 'error');
+            });
+    };
+
+    $scope.viewBiodata = function (id) {
+        $http.get(API_BASE + '/biodata/' + id)
+            .then(function (response) {
+                $scope.selectedBiodata = response.data;
+                $scope.showBiodataModal = true;
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to load biodata details', 'error');
+            });
+    };
+
+    $scope.deleteBiodata = function (id) {
+        if (!confirm('Are you sure you want to delete this biodata?')) return;
+
+        $http.delete(API_BASE + '/biodata/' + id)
+            .then(function (response) {
+                $scope.showToast('Biodata deleted successfully', 'success');
+                $scope.loadBiodatas();
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to delete biodata', 'error');
+            });
+    };
+
+    $scope.closeBiodataModal = function (event) {
+        if (event.target === event.currentTarget) {
+            $scope.showBiodataModal = false;
+        }
+    };
+
+    // ==================== VALIDATION ====================
+    $scope.loadPendingValidation = function () {
+        $scope.isLoading = true;
+
+        $http.get(API_BASE + '/biodata/pending')
+            .then(function (response) {
+                $scope.pendingValidation = response.data.items;
+                $scope.isLoading = false;
+            })
+            .catch(function (error) {
+                $scope.isLoading = false;
+                $scope.showToast('Failed to load pending validations', 'error');
+            });
+    };
+
+    $scope.approveValidation = function (id) {
+        $http.post(API_BASE + '/validation/approve/' + id)
+            .then(function (response) {
+                $scope.showToast('Biodata approved successfully', 'success');
+                $scope.loadPendingValidation();
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to approve biodata', 'error');
+            });
+    };
+
+    $scope.rejectValidation = function (id) {
+        if (!confirm('Are you sure you want to reject this biodata?')) return;
+
+        $http.post(API_BASE + '/validation/reject/' + id)
+            .then(function (response) {
+                $scope.showToast('Biodata rejected', 'success');
+                $scope.loadPendingValidation();
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to reject biodata', 'error');
+            });
+    };
+
+    $scope.rerunOCR = function (id) {
+        $scope.showToast('Re-running OCR...', 'success');
+
+        $http.post(API_BASE + '/validation/re-ocr/' + id)
+            .then(function (response) {
+                $scope.showToast('OCR re-processed successfully', 'success');
+                $scope.loadPendingValidation();
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to re-run OCR', 'error');
+            });
+    };
+
+    $scope.editValidation = function (biodata) {
+        $scope.editingBiodata = angular.copy(biodata);
+        $scope.showEditModal = true;
+    };
+
+    $scope.closeEditModal = function (event) {
+        if (event.target === event.currentTarget) {
+            $scope.showEditModal = false;
+        }
+    };
+
+    $scope.saveEditAndApprove = function () {
+        if (!$scope.editingBiodata) return;
+
+        $http.put(API_BASE + '/biodata/' + $scope.editingBiodata.id, $scope.editingBiodata)
+            .then(function (response) {
+                return $http.post(API_BASE + '/validation/approve/' + $scope.editingBiodata.id);
+            })
+            .then(function (response) {
+                $scope.showToast('Biodata saved and approved', 'success');
+                $scope.showEditModal = false;
+                $scope.loadPendingValidation();
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to save biodata', 'error');
+            });
+    };
+
+    $scope.autoApproveAll = function () {
+        var confidence = $scope.autoApproveConfidence || 0.35;
+
+        $http.post(API_BASE + '/validation/auto-approve-all?min_confidence=' + confidence)
+            .then(function (response) {
+                $scope.showToast('Auto-approved ' + response.data.approved_count + ' biodatas', 'success');
+                $scope.loadPendingValidation();
+            })
+            .catch(function (error) {
+                $scope.showToast('Error during auto-approve', 'error');
+            });
+    };
+
+    // ==================== SEARCH ====================
+    $scope.loadSearchStats = function () {
+        $http.get(API_BASE + '/search/stats')
+            .then(function (response) {
+                $scope.searchStats = response.data;
+            })
+            .catch(function (error) {
+                console.error('Failed to load search stats', error);
+            });
+    };
+
+    $scope.performSearch = function () {
+        $scope.isSearching = true;
+        $scope.hasSearched = true;
+
+        var preferences = {};
+        if ($scope.searchPrefs.gender) preferences.gender = $scope.searchPrefs.gender;
+        if ($scope.searchPrefs.min_age) preferences.min_age = parseInt($scope.searchPrefs.min_age);
+        if ($scope.searchPrefs.max_age) preferences.max_age = parseInt($scope.searchPrefs.max_age);
+        if ($scope.searchPrefs.religion) preferences.religion = $scope.searchPrefs.religion;
+        if ($scope.searchPrefs.caste) preferences.caste = $scope.searchPrefs.caste;
+        if ($scope.searchPrefs.education) preferences.education = $scope.searchPrefs.education;
+        if ($scope.searchPrefs.location) preferences.location = $scope.searchPrefs.location;
+
+        $http.post(API_BASE + '/search/preferences?limit=20', preferences)
+            .then(function (response) {
+                $scope.searchResults = response.data;
+                $scope.isSearching = false;
+            })
+            .catch(function (error) {
+                $scope.isSearching = false;
+                $scope.showToast('Search failed', 'error');
+            });
+    };
+
+    $scope.searchByUpload = function () {
+        var fileInput = document.getElementById('searchFileInput');
+        if (!fileInput || !fileInput.files.length) {
+            $scope.showToast('Please select a file first', 'error');
+            return;
+        }
+
+        $scope.isSearching = true;
+        $scope.hasSearched = true;
+
+        var formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+
+        $http.post(API_BASE + '/search/by-upload?limit=20', formData, {
+            transformRequest: angular.identity,
+            headers: { 'Content-Type': undefined }
+        }).then(function (response) {
+            $scope.searchResults = response.data;
+            $scope.isSearching = false;
+        }).catch(function (error) {
+            $scope.isSearching = false;
+            $scope.showToast('Search failed', 'error');
+        });
+    };
+
+    $scope.loadGraphData = function () {
+        $http.get(API_BASE + '/search/graph?limit=100')
+            .then(function (response) {
+                $scope.graphData = response.data;
+                $scope.renderGraph();
+                $scope.showToast('Graph loaded successfully', 'success');
+            })
+            .catch(function (error) {
+                $scope.showToast('Failed to load graph data', 'error');
+            });
+    };
+
+    $scope.loadGraphStats = function () {
+        // Note: This would need a separate endpoint for stats, but for now we'll use graph data
+        $scope.showToast('Stats feature coming soon', 'info');
+    };
+
+    $scope.renderGraph = function () {
+        if (!$scope.graphData || !$scope.graphData.nodes || $scope.graphData.nodes.length === 0) {
+            return;
+        }
+
+        var container = document.getElementById('graphContainer');
+
+        // Prepare nodes for Vis.js
+        var nodes = $scope.graphData.nodes.map(function (node) {
+            var color = '#97c2fc'; // default blue
+            if (node.type === 'Person') {
+                color = node.group === 'male' ? '#7be141' : '#e7717d'; // green for male, pink for female
+            } else if (node.type === 'Religion') {
+                color = '#ffa500'; // orange
+            } else if (node.type === 'Caste') {
+                color = '#ff6b6b'; // red
+            } else if (node.type === 'Location') {
+                color = '#4ecdc4'; // teal
+            } else if (node.type === 'Education') {
+                color = '#45b7d1'; // blue
+            } else if (node.type === 'Occupation') {
+                color = '#96ceb4'; // green
+            }
+
+            return {
+                id: node.id,
+                label: node.label || node.id,
+                color: color,
+                title: node.title || node.label,
+                group: node.type
+            };
+        });
+
+        // Prepare edges
+        var edges = ($scope.graphData.edges || []).map(function (edge) {
+            return {
+                from: edge.source,
+                to: edge.target,
+                label: edge.type,
+                arrows: 'to'
+            };
+        });
+
+        var data = {
+            nodes: new vis.DataSet(nodes),
+            edges: new vis.DataSet(edges)
+        };
+
+        var options = {
+            nodes: {
+                shape: 'dot',
+                size: 16,
+                font: {
+                    size: 12,
+                    color: '#333'
+                },
+                borderWidth: 2
+            },
+            edges: {
+                width: 2,
+                font: {
+                    size: 10,
+                    align: 'middle'
+                }
+            },
+            physics: {
+                stabilization: false,
+                barnesHut: {
+                    gravitationalConstant: -80000,
+                    springConstant: 0.001,
+                    springLength: 200
+                }
+            },
+            interaction: {
+                hover: true,
+                tooltipDelay: 200
+            }
+        };
+
+        if ($scope.network) {
+            $scope.network.destroy();
+        }
+
+        $scope.network = new vis.Network(container, data, options);
+    };
+
+    // ==================== GRAPH ====================
+    $scope.loadGraphData = function () {
+        $scope.isLoading = true;
+        $http.get(API_BASE + '/search/graph')
+            .then(function (response) {
+                $scope.isLoading = false;
+                $scope.renderGraph(response.data);
+            })
+            .catch(function (error) {
+                $scope.isLoading = false;
+                $scope.showToast('Failed to load graph data', 'error');
+                console.error(error);
+            });
+    };
+
+    $scope.renderGraph = function (data) {
+        var container = document.getElementById('network-container');
+
+        var nodes = new vis.DataSet(data.nodes.map(function (node) {
+            var color = '#e3f2fd'; // Default Person
+            var shape = 'dot';
+            var icon = null;
+
+            if (node.group === 'city') { color = '#e8f5e9'; shape = 'hexagon'; }
+            else if (node.group === 'education') { color = '#fff3e0'; shape = 'box'; }
+            else if (node.group === 'occupation') { color = '#f3e5f5'; shape = 'ellipse'; }
+            else if (node.group === 'religion') { color = '#fce4ec'; shape = 'diamond'; }
+            else if (node.group === 'caste') { color = '#e0f7fa'; shape = 'triangle'; }
+
+            return {
+                id: node.id,
+                label: node.label,
+                title: node.title,
+                group: node.group,
+                color: { background: color, border: color },
+                font: { size: 14 }
+            };
+        }));
+
+        var edges = new vis.DataSet(data.edges);
+
+        var options = {
+            nodes: {
+                borderWidth: 1,
+                shadow: true
+            },
+            edges: {
+                width: 1,
+                color: { inherit: 'from' },
+                smooth: { type: 'continuous' }
+            },
+            physics: {
+                stabilization: false,
+                barnesHut: {
+                    gravitationalConstant: -2000,
+                    springConstant: 0.04,
+                    springLength: 95
+                }
+            },
+            groups: {
+                person: { shape: 'dot', color: '#e3f2fd' }
+            },
+            interaction: {
+                hover: true,
+                tooltipDelay: 200
+            }
+        };
+
+        var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
+
+        network.on("click", function (params) {
+            if (params.nodes.length > 0) {
+                var nodeId = params.nodes[0];
+                var node = nodes.get(nodeId);
+                if (node.group === 'person') {
+                    $scope.$apply(function () {
+                        $scope.viewBiodata(node.id); // Open modal on click
+                    });
+                }
+            }
+        });
+    };
+
+    // ==================== HELPERS ====================
+    $scope.getConfidenceClass = function (confidence) {
+        if (!confidence) return 'low';
+        if (confidence >= 0.7) return 'high';
+        if (confidence >= 0.4) return 'medium';
+        return 'low';
+    };
+
+    $scope.getFileUrl = function (filePath) {
+        if (!filePath) return '#';
+        // Handle Windows and Unix separators
+        var filename = filePath.split(/[/\\]/).pop();
+        return '/files/' + filename;
+    };
+
+    // Initialize
+    $scope.init();
+}]);
+
+// ==============================================
+// DIRECTIVES
+// ==============================================
+
+// Drag and Drop Directive
+app.directive('ngDragover', function () {
+    return function (scope, element, attrs) {
+        element.bind('dragover', function (event) {
+            event.preventDefault();
+            scope.$apply(function () {
+                scope.$eval(attrs.ngDragover, { $event: event });
+            });
+        });
+    };
+});
+
+app.directive('ngDragleave', function () {
+    return function (scope, element, attrs) {
+        element.bind('dragleave', function (event) {
+            scope.$apply(function () {
+                scope.$eval(attrs.ngDragleave, { $event: event });
+            });
+        });
+    };
+});
+
+app.directive('ngDrop', function () {
+    return function (scope, element, attrs) {
+        element.bind('drop', function (event) {
+            event.preventDefault();
+            scope.$apply(function () {
+                scope.$eval(attrs.ngDrop, { $event: event });
+            });
+        });
+    };
+});
+
+// Array find polyfill for older browsers
+if (!Array.prototype.find) {
+    Array.prototype.find = function (predicate) {
+        for (var i = 0; i < this.length; i++) {
+            if (predicate(this[i], i, this)) {
+                return this[i];
+            }
+        }
+        return undefined;
+    };
 }
-
-function closeModal(modalId) {
-    document.getElementById(modalId).classList.remove('active');
-}
-
-// Toast notifications
-function showToast(message, type = 'success') {
-    const container = document.getElementById('toastContainer');
-    if (!container) return;
-
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.textContent = message;
-
-    container.appendChild(toast);
-
-    setTimeout(() => {
-        toast.remove();
-    }, 3000);
-}
-
-// Initial data load
-async function loadInitialData() {
-    // Nothing to load initially, data loads when navigating
-}
-
-// Expose functions to global scope for onclick handlers
-window.viewBiodata = viewBiodata;
-window.deleteBiodata = deleteBiodata;
-window.approveValidation = approveValidation;
-window.rejectValidation = rejectValidation;
-window.rerunOCR = rerunOCR;
-window.editValidation = editValidation;
-window.autoApproveAll = autoApproveAll;
-window.searchByUpload = searchByUpload;
-window.closeModal = closeModal;
-window.saveEditAndApprove = saveEditAndApprove;
-window.performSearch = performSearch;

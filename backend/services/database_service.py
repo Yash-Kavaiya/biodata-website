@@ -1,6 +1,7 @@
 """
 Database Service - JSON-based local database.
 Follows Single Responsibility and Interface Segregation principles.
+Optimized with in-memory caching and O(1) lookups.
 """
 import json
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import threading
+import asyncio
 from contextlib import contextmanager
 
 from backend.config import settings
@@ -17,12 +19,16 @@ from backend.models import BiodataInDB, OCRStatus
 class JSONDatabase:
     """
     JSON file-based database for biodata storage.
-    Thread-safe implementation with file locking.
+    Thread-safe implementation with in-memory caching for O(1) lookups.
     """
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or (settings.DB_DIR / "biodata.json")
         self._lock = threading.Lock()
+        # In-memory cache for O(1) lookups
+        self._cache: Optional[Dict[str, Any]] = None
+        self._index: Dict[str, int] = {}  # id -> index mapping
+        self._cache_valid = False
         self._ensure_db_exists()
 
     def _ensure_db_exists(self):
@@ -32,26 +38,53 @@ class JSONDatabase:
             self._write_data({"biodatas": [], "metadata": {"version": "1.0", "created_at": datetime.utcnow().isoformat()}})
 
     @contextmanager
-    def _file_lock(self):
-        """Thread-safe file access context manager."""
-        self._lock.acquire()
+    def _file_lock(self, timeout=2.0):
+        """Thread-safe file access context manager with retry."""
+        acquired = self._lock.acquire(timeout=timeout)
+        if not acquired:
+            # Fallback or simple blocking if timeout fails logic
+            # For simplicity in this context, we just block if timeout provided is small, 
+            # OR we try-except in the caller. But here we force wait with retry loop is better?
+            # Actually, standard Lock.acquire(timeout) returns bool.
+            # If we fail, we raise specific error.
+            raise TimeoutError("Database lock could not be acquired.")
+        
         try:
             yield
         finally:
             self._lock.release()
 
     def _read_data(self) -> Dict[str, Any]:
-        """Read all data from JSON file."""
+        """Read all data from JSON file with caching."""
+        if self._cache_valid and self._cache is not None:
+            return self._cache
         try:
             with open(self.db_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                self._cache = json.load(f)
+                self._rebuild_index()
+                self._cache_valid = True
+                return self._cache
         except (json.JSONDecodeError, FileNotFoundError):
-            return {"biodatas": [], "metadata": {"version": "1.0"}}
+            self._cache = {"biodatas": [], "metadata": {"version": "1.0"}}
+            self._index = {}
+            self._cache_valid = True
+            return self._cache
+
+    def _rebuild_index(self):
+        """Rebuild the id -> index mapping for O(1) lookups."""
+        self._index = {}
+        if self._cache:
+            for i, item in enumerate(self._cache.get("biodatas", [])):
+                if item.get("id"):
+                    self._index[item["id"]] = i
 
     def _write_data(self, data: Dict[str, Any]):
-        """Write data to JSON file."""
+        """Write data to JSON file and update cache."""
         with open(self.db_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+        self._cache = data
+        self._rebuild_index()
+        self._cache_valid = True
 
     async def create(self, biodata: BiodataInDB) -> BiodataInDB:
         """
@@ -74,7 +107,7 @@ class JSONDatabase:
 
     async def get_by_id(self, biodata_id: str) -> Optional[BiodataInDB]:
         """
-        Get biodata by ID.
+        Get biodata by ID using O(1) index lookup.
 
         Args:
             biodata_id: Unique identifier
@@ -84,9 +117,12 @@ class JSONDatabase:
         """
         with self._file_lock():
             data = self._read_data()
-            for item in data["biodatas"]:
-                if item.get("id") == biodata_id:
-                    return BiodataInDB(**item)
+            # O(1) lookup via index
+            if biodata_id in self._index:
+                idx = self._index[biodata_id]
+                biodatas = data.get("biodatas", [])
+                if idx < len(biodatas):
+                    return BiodataInDB(**biodatas[idx])
             return None
 
     async def get_all(
@@ -128,7 +164,7 @@ class JSONDatabase:
 
     async def update(self, biodata_id: str, update_data: Dict[str, Any]) -> Optional[BiodataInDB]:
         """
-        Update biodata by ID.
+        Update biodata by ID using O(1) index lookup.
 
         Args:
             biodata_id: Unique identifier
@@ -139,21 +175,26 @@ class JSONDatabase:
         """
         with self._file_lock():
             data = self._read_data()
-            for i, item in enumerate(data["biodatas"]):
-                if item.get("id") == biodata_id:
-                    # Update fields
-                    for key, value in update_data.items():
-                        if value is not None:
-                            item[key] = value
-                    item["updated_at"] = datetime.utcnow().isoformat()
-                    data["biodatas"][i] = item
-                    self._write_data(data)
-                    return BiodataInDB(**item)
-            return None
+            # O(1) lookup via index
+            if biodata_id not in self._index:
+                return None
+            idx = self._index[biodata_id]
+            biodatas = data.get("biodatas", [])
+            if idx >= len(biodatas):
+                return None
+            item = biodatas[idx]
+            # Update fields
+            for key, value in update_data.items():
+                if value is not None:
+                    item[key] = value
+            item["updated_at"] = datetime.utcnow().isoformat()
+            data["biodatas"][idx] = item
+            self._write_data(data)
+            return BiodataInDB(**item)
 
     async def delete(self, biodata_id: str) -> bool:
         """
-        Delete biodata by ID.
+        Delete biodata by ID using O(1) index lookup.
 
         Args:
             biodata_id: Unique identifier
@@ -163,10 +204,14 @@ class JSONDatabase:
         """
         with self._file_lock():
             data = self._read_data()
-            original_len = len(data["biodatas"])
-            data["biodatas"] = [b for b in data["biodatas"] if b.get("id") != biodata_id]
-            if len(data["biodatas"]) < original_len:
-                self._write_data(data)
+            # O(1) check if exists
+            if biodata_id not in self._index:
+                return False
+            idx = self._index[biodata_id]
+            biodatas = data.get("biodatas", [])
+            if idx < len(biodatas):
+                del biodatas[idx]
+                self._write_data(data)  # This rebuilds the index
                 return True
             return False
 

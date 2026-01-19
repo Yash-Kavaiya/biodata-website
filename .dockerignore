@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.example
+__pycache__
+venv/
+.gemini/
+.vscode/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+uploads/*
+storage/*

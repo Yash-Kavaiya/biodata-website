@@ -1,6 +1,7 @@
 """
 Search Router - Match finding and similarity search.
 """
+
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
@@ -12,15 +13,29 @@ from backend.models import (
     MaritalStatus,
     OCRStatus,
 )
-from backend.services import db, storage_service, ocr_service, similarity_service
+from backend.services import (
+    db,
+    storage_service,
+    ocr_service,
+    similarity_service,
+    neo4j_service,
+    graph_service,
+)
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
 
+@router.get("/graph")
+async def get_graph_data(
+    biodata_id: Optional[str] = None, limit: int = Query(50, ge=1, le=200)
+):
+    """Get graph data for visualization."""
+    return await graph_service.get_graph_data(biodata_id, limit)
+
+
 @router.post("/preferences", response_model=List[MatchResult])
 async def search_by_preferences(
-    preferences: SearchPreferences,
-    limit: int = Query(10, ge=1, le=50)
+    preferences: SearchPreferences, limit: int = Query(10, ge=1, le=50)
 ):
     """
     Find matching biodatas based on preferences.
@@ -37,9 +52,7 @@ async def search_by_preferences(
 
     # Find matches
     matches = await similarity_service.find_matches(
-        preferences=preferences,
-        biodatas=approved,
-        limit=limit
+        preferences=preferences, biodatas=approved, limit=limit
     )
 
     return matches
@@ -54,7 +67,7 @@ async def simple_search(
     caste: Optional[str] = None,
     education: Optional[str] = None,
     location: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=50)
+    limit: int = Query(10, ge=1, le=50),
 ):
     """
     Simple search endpoint with query parameters.
@@ -73,27 +86,19 @@ async def simple_search(
         religion=religion,
         caste=caste,
         education=education,
-        location=location
+        location=location,
     )
 
     approved = await db.get_approved_biodatas()
     matches = await similarity_service.find_matches(
-        preferences=preferences,
-        biodatas=approved,
-        limit=limit
+        preferences=preferences, biodatas=approved, limit=limit
     )
 
-    return {
-        "total": len(matches),
-        "matches": matches
-    }
+    return {"total": len(matches), "matches": matches}
 
 
 @router.post("/by-biodata/{biodata_id}", response_model=List[MatchResult])
-async def search_by_biodata(
-    biodata_id: str,
-    limit: int = Query(10, ge=1, le=50)
-):
+async def search_by_biodata(biodata_id: str, limit: int = Query(10, ge=1, le=50)):
     """
     Find matches similar to an existing biodata.
     Useful for finding compatible profiles.
@@ -104,18 +109,24 @@ async def search_by_biodata(
 
     approved = await db.get_approved_biodatas()
     matches = await similarity_service.find_similar_profiles(
-        source_biodata=source,
-        biodatas=approved,
-        limit=limit
+        source_biodata=source, biodatas=approved, limit=limit
     )
 
     return matches
 
 
+@router.get("/graph/similar/{biodata_id}")
+async def get_similar_graph(biodata_id: str, limit: int = Query(10, ge=1, le=20)):
+    """
+    Get graph-based similar biodatas.
+    """
+    similar = await graph_service.find_similar(biodata_id, limit)
+    return {"similar": similar}
+
+
 @router.post("/by-upload", response_model=List[MatchResult])
 async def search_by_upload(
-    file: UploadFile = File(...),
-    limit: int = Query(10, ge=1, le=50)
+    file: UploadFile = File(...), limit: int = Query(10, ge=1, le=50)
 ):
     """
     Upload a biodata and find matching profiles.
@@ -135,10 +146,7 @@ async def search_by_upload(
     if status == OCRStatus.FAILED:
         # Clean up
         await storage_service.delete_file(file_path)
-        raise HTTPException(
-            status_code=400,
-            detail=f"OCR failed: {raw_text}"
-        )
+        raise HTTPException(status_code=400, detail=f"OCR failed: {raw_text}")
 
     # Create temporary biodata for searching
     temp_biodata = BiodataInDB(
@@ -152,9 +160,7 @@ async def search_by_upload(
     # Find matches
     approved = await db.get_approved_biodatas()
     matches = await similarity_service.find_similar_profiles(
-        source_biodata=temp_biodata,
-        biodatas=approved,
-        limit=limit
+        source_biodata=temp_biodata, biodatas=approved, limit=limit
     )
 
     # Clean up temporary file
@@ -166,36 +172,34 @@ async def search_by_upload(
 @router.get("/stats")
 async def get_search_stats():
     """Get statistics about available biodatas for matching."""
+    from collections import Counter
+
     approved = await db.get_approved_biodatas()
 
-    stats = {
-        "total_approved": len(approved),
-        "by_gender": {},
-        "by_religion": {},
-        "age_range": {"min": None, "max": None},
-        "by_location": {},
-    }
+    # Use Counter for O(1) amortized increments
+    gender_counts: Counter = Counter()
+    religion_counts: Counter = Counter()
+    location_counts: Counter = Counter()
+    min_age = float("inf")
+    max_age = float("-inf")
 
-    ages = []
     for biodata in approved:
-        # Gender stats
-        gender = biodata.gender.value if biodata.gender else "unknown"
-        stats["by_gender"][gender] = stats["by_gender"].get(gender, 0) + 1
-
-        # Religion stats
-        religion = biodata.religion or "unknown"
-        stats["by_religion"][religion] = stats["by_religion"].get(religion, 0) + 1
-
-        # Age stats
+        gender_counts[biodata.gender.value if biodata.gender else "unknown"] += 1
+        religion_counts[biodata.religion or "unknown"] += 1
+        location_counts[biodata.current_city or biodata.state or "unknown"] += 1
         if biodata.age:
-            ages.append(biodata.age)
+            if biodata.age < min_age:
+                min_age = biodata.age
+            if biodata.age > max_age:
+                max_age = biodata.age
 
-        # Location stats
-        location = biodata.current_city or biodata.state or "unknown"
-        stats["by_location"][location] = stats["by_location"].get(location, 0) + 1
-
-    if ages:
-        stats["age_range"]["min"] = min(ages)
-        stats["age_range"]["max"] = max(ages)
-
-    return stats
+    return {
+        "total_approved": len(approved),
+        "by_gender": dict(gender_counts),
+        "by_religion": dict(religion_counts),
+        "age_range": {
+            "min": min_age if min_age != float("inf") else None,
+            "max": max_age if max_age != float("-inf") else None,
+        },
+        "by_location": dict(location_counts),
+    }

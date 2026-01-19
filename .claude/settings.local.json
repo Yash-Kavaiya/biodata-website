@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(timeout:*)",
+      "Bash(curl:*)",
+      "Bash(gcloud config get-value:*)",
+      "Bash(taskkill:*)",
+      "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep -Seconds 2; Write-Host ''Python processes killed''\")",
+      "Bash(pip install:*)"
+    ]
+  }
+}

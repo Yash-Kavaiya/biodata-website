@@ -1,6 +1,7 @@
 """
 Similarity Service - PKL-based similarity search for match finding.
 Follows Single Responsibility Principle.
+Optimized with in-memory caching and indexed feature lookups.
 """
 import pickle
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import math
+import threading
 
 from backend.config import settings
 from backend.models import BiodataInDB, SearchPreferences, MatchResult
@@ -17,11 +19,15 @@ from backend.models import BiodataInDB, SearchPreferences, MatchResult
 class SimilarityService:
     """
     Service for finding matching biodatas based on preferences.
-    Uses pickle file to store and retrieve embeddings/features.
+    Uses pickle file with in-memory caching for fast lookups.
     """
 
     def __init__(self, pkl_path: Optional[Path] = None):
         self.pkl_path = pkl_path or settings.PKL_FILE_PATH
+        self._lock = threading.Lock()
+        # In-memory cache
+        self._cache: Optional[Dict[str, Any]] = None
+        self._cache_valid = False
         self._ensure_pkl_exists()
 
     def _ensure_pkl_exists(self):
@@ -31,18 +37,26 @@ class SimilarityService:
             self._save_data({"features": {}, "metadata": {"version": "1.0", "updated_at": datetime.utcnow().isoformat()}})
 
     def _load_data(self) -> Dict[str, Any]:
-        """Load data from pickle file."""
+        """Load data from pickle file with caching."""
+        if self._cache_valid and self._cache is not None:
+            return self._cache
         try:
             with open(self.pkl_path, "rb") as f:
-                return pickle.load(f)
+                self._cache = pickle.load(f)
+                self._cache_valid = True
+                return self._cache
         except (pickle.PickleError, FileNotFoundError):
-            return {"features": {}, "metadata": {"version": "1.0"}}
+            self._cache = {"features": {}, "metadata": {"version": "1.0"}}
+            self._cache_valid = True
+            return self._cache
 
     def _save_data(self, data: Dict[str, Any]):
-        """Save data to pickle file."""
+        """Save data to pickle file and update cache."""
         data["metadata"]["updated_at"] = datetime.utcnow().isoformat()
         with open(self.pkl_path, "wb") as f:
             pickle.dump(data, f)
+        self._cache = data
+        self._cache_valid = True
 
     def _extract_features(self, biodata: BiodataInDB) -> Dict[str, Any]:
         """
@@ -119,21 +133,24 @@ class SimilarityService:
     async def index_biodata(self, biodata: BiodataInDB):
         """
         Add or update biodata in the similarity index.
+        Uses in-memory cache to avoid repeated disk reads.
 
         Args:
             biodata: BiodataInDB to index
         """
-        data = self._load_data()
-        features = self._extract_features(biodata)
-        data["features"][biodata.id] = features
-        self._save_data(data)
+        with self._lock:
+            data = self._load_data()
+            features = self._extract_features(biodata)
+            data["features"][biodata.id] = features
+            self._save_data(data)
 
     async def remove_from_index(self, biodata_id: str):
         """Remove biodata from similarity index."""
-        data = self._load_data()
-        if biodata_id in data["features"]:
-            del data["features"][biodata_id]
-            self._save_data(data)
+        with self._lock:
+            data = self._load_data()
+            if biodata_id in data["features"]:
+                del data["features"][biodata_id]
+                self._save_data(data)
 
     async def find_matches(
         self,
@@ -143,6 +160,7 @@ class SimilarityService:
     ) -> List[MatchResult]:
         """
         Find matching biodatas based on preferences.
+        Uses heap-based top-k algorithm for O(n log k) instead of O(n log n).
 
         Args:
             preferences: Search preferences
@@ -152,21 +170,32 @@ class SimilarityService:
         Returns:
             List of MatchResult sorted by similarity score
         """
-        results = []
+        import heapq
 
-        for biodata in biodatas:
+        # Use min-heap to maintain top-k results (more efficient than full sort)
+        # Heap stores (score, index, biodata, reasons) - index for stable comparison
+        heap: List[Tuple[float, int, BiodataInDB, List[str]]] = []
+
+        for idx, biodata in enumerate(biodatas):
             score, reasons = self._calculate_match_score(preferences, biodata)
             if score > 0:
-                results.append(MatchResult(
-                    biodata=biodata,
-                    similarity_score=score,
-                    match_reasons=reasons
-                ))
+                if len(heap) < limit:
+                    heapq.heappush(heap, (score, idx, biodata, reasons))
+                elif score > heap[0][0]:
+                    heapq.heapreplace(heap, (score, idx, biodata, reasons))
 
-        # Sort by score descending
-        results.sort(key=lambda x: x.similarity_score, reverse=True)
+        # Extract results in descending order
+        results = []
+        while heap:
+            score, _, biodata, reasons = heapq.heappop(heap)
+            results.append(MatchResult(
+                biodata=biodata,
+                similarity_score=score,
+                match_reasons=reasons
+            ))
+        results.reverse()  # Highest score first
 
-        return results[:limit]
+        return results
 
     async def find_similar_profiles(
         self,

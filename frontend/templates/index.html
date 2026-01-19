@@ -1,39 +1,82 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" ng-app="biodataApp">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Biodata Management System</title>
+    <title>Biodata Manager - Find Your Perfect Match</title>
+    <meta name="description" content="Elegant biodata management system for matrimonial profiles">
+
+    <!-- Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=Lato:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+
+    <!-- Styles -->
     <link rel="stylesheet" href="/static/css/styles.css">
+
+    <!-- AngularJS - Multiple CDN fallbacks -->
+    <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.8.3/angular.min.js"></script>
+    <script>
+        // Fallback if Google CDN fails
+        if (typeof angular === 'undefined') {
+            document.write('<script src="https://unpkg.com/angular@1.8.3/angular.min.js"><\/script>');
+        }
+    </script>
+
+    <!-- Vis.js for graph visualization -->
+    <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
 </head>
-<body>
+
+<body ng-controller="MainController">
     <!-- Navigation -->
     <nav class="navbar">
         <div class="navbar-content">
             <a href="/" class="logo">Biodata Manager</a>
             <ul class="nav-links">
-                <li><a href="#" data-page="upload" class="active">Upload</a></li>
-                <li><a href="#" data-page="validation">Validation</a></li>
-                <li><a href="#" data-page="biodatas">All Biodatas</a></li>
-                <li><a href="#" data-page="search">Find Match</a></li>
+                <li><a href="#" ng-click="navigateTo('upload')" ng-class="{active: currentPage === 'upload'}">Upload</a>
+                </li>
+                <li><a href="#" ng-click="navigateTo('validation')"
+                        ng-class="{active: currentPage === 'validation'}">Validation</a></li>
+                <li><a href="#" ng-click="navigateTo('biodatas')" ng-class="{active: currentPage === 'biodatas'}">All
+                        Biodatas</a></li>
+                <li><a href="#" ng-click="navigateTo('search')" ng-class="{active: currentPage === 'search'}">Find
+                        Match</a></li>
+                <li><a href="#" ng-click="navigateTo('graph')" ng-class="{active: currentPage === 'graph'}">Graph
+                        View</a></li>
             </ul>
         </div>
     </nav>
 
     <main class="container">
         <!-- Upload Page -->
-        <section id="uploadPage" class="page-section active">
+        <section id="uploadPage" class="page-section" ng-show="currentPage === 'upload'">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">Upload Biodata</h2>
-                    <span style="color: var(--text-secondary);">Single or bulk upload supported</span>
+                    <h2 class="card-title">💒 Upload Biodata</h2>
+                    <span class="text-muted">Single or bulk upload supported</span>
                 </div>
 
-                <div id="uploadArea" class="upload-area">
-                    <div class="upload-icon">📄</div>
+                <!-- Upload Type Toggle -->
+                <div class="upload-toggle" style="margin-bottom: 1rem; display: flex; gap: 1rem;">
+                    <button class="btn" ng-class="{'btn-primary': uploadType === 'files', 'btn-secondary': uploadType !== 'files'}"
+                        ng-click="uploadType = 'files'">
+                        📄 Upload Files
+                    </button>
+                    <button class="btn" ng-class="{'btn-primary': uploadType === 'folder', 'btn-secondary': uploadType !== 'folder'}"
+                        ng-click="uploadType = 'folder'">
+                        📁 Upload Folder
+                    </button>
+                </div>
+
+                <!-- File Upload Area -->
+                <div id="uploadArea" class="upload-area" ng-click="triggerFileInput()"
+                    ng-class="{'drag-over': isDragOver}" ng-dragover="handleDragOver($event)"
+                    ng-dragleave="isDragOver = false" ng-drop="handleDrop($event)"
+                    ng-show="uploadType !== 'folder'">
+                    <span class="upload-icon">📄</span>
                     <div class="upload-text">
                         <strong>Click to upload</strong> or drag and drop
                     </div>
@@ -42,104 +85,300 @@
                     </div>
                 </div>
 
-                <input type="file" id="fileInput" multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;">
+                <!-- Folder Upload Area -->
+                <div id="folderUploadArea" class="upload-area" ng-click="triggerFolderInput()"
+                    ng-class="{'drag-over': isDragOver}"
+                    ng-show="uploadType === 'folder'">
+                    <span class="upload-icon">📁</span>
+                    <div class="upload-text">
+                        <strong>Click to select folder</strong>
+                    </div>
+                    <div class="upload-hint">
+                        Select a folder containing PDF, PNG, JPG files (up to 200 files)
+                    </div>
+                </div>
 
-                <div id="uploadQueue" class="upload-queue"></div>
+                <div class="model-selector">
+                    <label class="form-label">
+                        <span style="font-size: 1.25rem;">🤖</span>
+                        <strong>Gemini Model</strong>
+                    </label>
+                    <select id="modelSelect" class="form-select" ng-model="selectedModel"
+                        ng-options="model as (model === defaultModel ? model + ' (default)' : model) for model in availableModels">
+                    </select>
+                    <p class="text-muted" style="font-size: 0.75rem; margin-top: 0.5rem;">
+                        Select the Vertex AI Gemini model for OCR processing
+                    </p>
+                </div>
+
+                <input type="file" id="fileInput" multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;"
+                    onchange="angular.element(this).scope().handleFileSelect(this.files)">
+
+                <!-- Folder input with webkitdirectory attribute -->
+                <input type="file" id="folderInput" webkitdirectory directory multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;"
+                    onchange="angular.element(this).scope().handleFolderSelect(this.files)">
+
+                <!-- Batch Job Progress -->
+                <div class="batch-progress" ng-if="batchJob" style="margin: 1rem 0; padding: 1rem; background: var(--neutral-100); border-radius: var(--radius-md);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <strong>Batch Upload Progress</strong>
+                        <span class="badge badge-{{batchJob.status}}">{{batchJob.status}}</span>
+                    </div>
+                    <div class="progress-bar" style="background: #e0e0e0; border-radius: 4px; height: 20px; overflow: hidden;">
+                        <div style="background: linear-gradient(90deg, var(--primary-color), var(--accent-color)); height: 100%; transition: width 0.3s;"
+                            ng-style="{width: batchJob.progress_percent + '%'}"></div>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.875rem;">
+                        <span>{{batchJob.processed}} / {{batchJob.total}} files processed</span>
+                        <span style="color: var(--success-color);">✓ {{batchJob.successful}} success</span>
+                        <span ng-if="batchJob.failed > 0" style="color: var(--error-color);">✕ {{batchJob.failed}} failed</span>
+                        <span>{{batchJob.progress_percent | number:1}}%</span>
+                    </div>
+                    <div ng-if="batchJob.errors && batchJob.errors.length > 0" style="margin-top: 0.5rem; color: var(--error-color); font-size: 0.75rem;">
+                        <div ng-repeat="err in batchJob.errors track by $index">{{err.filename}}: {{err.error}}</div>
+                    </div>
+                </div>
+
+                <div class="upload-queue" ng-if="uploadQueue.length > 0">
+                    <div class="upload-item" ng-repeat="item in uploadQueue">
+                        <div class="upload-item-info">
+                            <div class="upload-item-name">{{item.name}}</div>
+                            <div class="upload-item-status">
+                                <span ng-if="item.status === 'pending'">Waiting...</span>
+                                <span ng-if="item.status === 'uploading'">Uploading...</span>
+                                <span ng-if="item.status === 'completed'">✓ {{item.message || 'Success'}}</span>
+                                <span ng-if="item.status === 'failed'">✕ {{item.error || 'Error'}}</span>
+                            </div>
+                        </div>
+                        <span class="badge badge-{{item.status}}">{{item.status}}</span>
+                    </div>
+                </div>
             </div>
 
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">How it works</h2>
+                    <h2 class="card-title">💫 How it works</h2>
                 </div>
-                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem;">
-                    <div style="text-align: center; padding: 1rem;">
-                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">1️⃣</div>
+                <div class="how-it-works">
+                    <div class="how-it-works-step">
+                        <span class="step-icon">1️⃣</span>
                         <strong>Upload</strong>
-                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Upload biodata PDF or image files</p>
+                        <p>Upload biodata PDF or image files</p>
                     </div>
-                    <div style="text-align: center; padding: 1rem;">
-                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">2️⃣</div>
+                    <div class="how-it-works-step">
+                        <span class="step-icon">2️⃣</span>
                         <strong>OCR Processing</strong>
-                        <p style="color: var(--text-secondary); font-size: 0.875rem;">LLM extracts information automatically</p>
+                        <p>AI extracts information automatically</p>
                     </div>
-                    <div style="text-align: center; padding: 1rem;">
-                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">3️⃣</div>
+                    <div class="how-it-works-step">
+                        <span class="step-icon">3️⃣</span>
                         <strong>Validate</strong>
-                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Review and approve extracted data</p>
+                        <p>Review and approve extracted data</p>
                     </div>
-                    <div style="text-align: center; padding: 1rem;">
-                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">4️⃣</div>
+                    <div class="how-it-works-step">
+                        <span class="step-icon">4️⃣</span>
                         <strong>Match</strong>
-                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Find compatible profiles</p>
+                        <p>Find compatible profiles</p>
                     </div>
                 </div>
             </div>
         </section>
 
         <!-- Validation Page -->
-        <section id="validationPage" class="page-section">
+        <section id="validationPage" class="page-section" ng-show="currentPage === 'validation'">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">OCR Validation</h2>
+                    <h2 class="card-title">✨ OCR Validation</h2>
                     <div class="btn-group">
-                        <input type="number" id="autoApproveConfidence" class="form-input"
-                               style="width: 100px;" placeholder="0.7" min="0" max="1" step="0.1" value="0.7">
-                        <button class="btn btn-success" onclick="autoApproveAll()">
+                        <input type="number" ng-model="autoApproveConfidence" class="form-input" style="width: 100px;"
+                            placeholder="0.7" min="0" max="1" step="0.1">
+                        <button class="btn btn-success" ng-click="autoApproveAll()">
                             Auto-Approve All
                         </button>
                     </div>
                 </div>
-                <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                <p class="text-muted">
                     Review OCR results and approve, edit, or reject extracted biodata.
                 </p>
             </div>
 
             <div id="validationList">
-                <div class="empty-state">
+                <div class="empty-state" ng-if="isLoading">
                     <div class="spinner"></div>
+                </div>
+
+                <div class="empty-state" ng-if="!isLoading && pendingValidation.length === 0">
+                    <span class="empty-state-icon">✅</span>
+                    <div class="empty-state-text">No pending validations</div>
+                    <p class="text-muted">All OCR results have been validated</p>
+                </div>
+
+                <div class="validation-card" ng-repeat="biodata in pendingValidation">
+                    <div class="validation-header">
+                        <div>
+                            <strong>{{biodata.name || 'Unknown'}}</strong>
+                            <span class="badge badge-{{biodata.ocr_status}}"
+                                style="margin-left: 0.5rem;">{{biodata.ocr_status}}</span>
+                        </div>
+                        <div class="confidence-indicator">
+                            <span>Confidence:</span>
+                            <div class="confidence-bar">
+                                <div class="confidence-fill" ng-class="getConfidenceClass(biodata.ocr_confidence)"
+                                    ng-style="{width: (biodata.ocr_confidence || 0) * 100 + '%'}"></div>
+                            </div>
+                            <span>{{(biodata.ocr_confidence || 0) * 100 | number:0}}%</span>
+                        </div>
+                    </div>
+                    <div class="validation-body">
+                        <div class="form-row">
+                            <div class="form-group" ng-repeat="field in validationFields">
+                                <label class="form-label">{{field.label}}</label>
+                                <input type="text" class="form-input" ng-value="biodata[field.key] || ''" readonly>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="validation-actions">
+                        <a ng-if="biodata.file_path" href="{{getFileUrl(biodata.file_path)}}" target="_blank"
+                            class="btn btn-secondary"
+                            style="text-decoration: none; display: flex; align-items: center; justify-content: center;">
+                            📄 View PDF
+                        </a>
+                        <button class="btn btn-success" ng-click="approveValidation(biodata.id)">
+                            ✓ Approve
+                        </button>
+                        <button class="btn btn-warning" ng-click="editValidation(biodata)">
+                            ✎ Edit & Approve
+                        </button>
+                        <button class="btn btn-secondary" ng-click="rerunOCR(biodata.id)">
+                            ↻ Re-OCR
+                        </button>
+                        <button class="btn btn-danger" ng-click="rejectValidation(biodata.id)">
+                            ✕ Reject
+                        </button>
+                    </div>
                 </div>
             </div>
         </section>
 
         <!-- All Biodatas Page -->
-        <section id="biodatasPage" class="page-section">
+        <section id="biodatasPage" class="page-section" ng-show="currentPage === 'biodatas'">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">All Biodatas</h2>
-                    <button class="btn btn-primary" onclick="loadBiodatas()">
+                    <h2 class="card-title">💝 All Biodatas</h2>
+                    <button class="btn btn-primary" ng-click="loadBiodatas()">
                         ↻ Refresh
                     </button>
                 </div>
 
                 <div id="biodataTable">
-                    <div class="empty-state">
+                    <div class="empty-state" ng-if="isLoading">
                         <div class="spinner"></div>
+                    </div>
+
+                    <div class="empty-state" ng-if="!isLoading && biodatas.length === 0">
+                        <span class="empty-state-icon">📋</span>
+                        <div class="empty-state-text">No biodatas found</div>
+                        <p class="text-muted">Upload some biodata files to get started</p>
+                    </div>
+
+                    <div class="table-container" ng-if="!isLoading && biodatas.length > 0">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Name</th>
+                                    <th>Age</th>
+                                    <th>Gender</th>
+                                    <th>Education</th>
+                                    <th>Location</th>
+                                    <th>Status</th>
+                                    <th>Confidence</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr ng-repeat="biodata in biodatas">
+                                    <td>{{biodata.name || '-'}}</td>
+                                    <td>{{biodata.age || '-'}}</td>
+                                    <td>{{biodata.gender || '-'}}</td>
+                                    <td>{{biodata.education || '-'}}</td>
+                                    <td>{{biodata.current_city || biodata.state || '-'}}</td>
+                                    <td><span class="badge badge-{{biodata.ocr_status}}">{{biodata.ocr_status}}</span>
+                                    </td>
+                                    <td>
+                                        <div class="confidence-indicator">
+                                            <div class="confidence-bar">
+                                                <div class="confidence-fill"
+                                                    ng-class="getConfidenceClass(biodata.ocr_confidence)"
+                                                    ng-style="{width: (biodata.ocr_confidence || 0) * 100 + '%'}"></div>
+                                            </div>
+                                            <span>{{(biodata.ocr_confidence || 0) * 100 | number:0}}%</span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="btn-group">
+                                            <button class="btn btn-sm btn-secondary"
+                                                ng-click="viewBiodata(biodata.id)">View</button>
+                                            <button class="btn btn-sm btn-danger"
+                                                ng-click="deleteBiodata(biodata.id)">Delete</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div ng-if="!isLoading && biodatas.length > 0" style="margin-top: 1rem; text-align: center;"
+                        class="text-muted">
+                        Showing {{biodatas.length}} of {{totalBiodatas}} biodatas
                     </div>
                 </div>
             </div>
         </section>
 
         <!-- Search/Match Page -->
-        <section id="searchPage" class="page-section">
+        <section id="searchPage" class="page-section" ng-show="currentPage === 'search'">
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">Find Your Perfect Match</h2>
+                    <h2 class="card-title">💕 Find Your Perfect Match</h2>
                 </div>
 
-                <div id="searchStats"></div>
+                <div id="searchStats" ng-if="searchStats">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-value">{{searchStats.total_approved}}</div>
+                            <div class="stat-label">Total Profiles</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value">{{searchStats.by_gender.male || 0}}</div>
+                            <div class="stat-label">Male Profiles</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value">{{searchStats.by_gender.female || 0}}</div>
+                            <div class="stat-label">Female Profiles</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-value">{{searchStats.age_range.min || '-'}} - {{searchStats.age_range.max
+                                || '-'}}</div>
+                            <div class="stat-label">Age Range</div>
+                        </div>
+                    </div>
+                </div>
 
                 <!-- Tabs -->
                 <div class="tabs">
-                    <button class="tab active" onclick="switchSearchTab('preferences')">Search by Preferences</button>
-                    <button class="tab" onclick="switchSearchTab('upload')">Search by Upload</button>
+                    <button class="tab" ng-class="{active: searchTab === 'preferences'}"
+                        ng-click="searchTab = 'preferences'">Search by Preferences</button>
+                    <button class="tab" ng-class="{active: searchTab === 'upload'}"
+                        ng-click="searchTab = 'upload'">Search by Upload</button>
+                    <button class="tab" ng-class="{active: searchTab === 'graph'}" ng-click="searchTab = 'graph'">Graph
+                        View</button>
                 </div>
 
                 <!-- Search by Preferences -->
-                <div id="preferencesTab" class="tab-content active">
-                    <form id="searchForm" class="search-form">
+                <div id="preferencesTab" class="tab-content" ng-class="{active: searchTab === 'preferences'}">
+                    <form id="searchForm" class="search-form" ng-submit="performSearch()">
                         <div class="form-group">
                             <label class="form-label">Gender</label>
-                            <select name="gender" class="form-select">
+                            <select ng-model="searchPrefs.gender" class="form-select">
                                 <option value="">Any</option>
                                 <option value="male">Male</option>
                                 <option value="female">Female</option>
@@ -147,27 +386,33 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">Min Age</label>
-                            <input type="number" name="min_age" class="form-input" placeholder="18" min="18">
+                            <input type="number" ng-model="searchPrefs.min_age" class="form-input" placeholder="18"
+                                min="18">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Max Age</label>
-                            <input type="number" name="max_age" class="form-input" placeholder="60" max="100">
+                            <input type="number" ng-model="searchPrefs.max_age" class="form-input" placeholder="60"
+                                max="100">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Religion</label>
-                            <input type="text" name="religion" class="form-input" placeholder="e.g., Hindu">
+                            <input type="text" ng-model="searchPrefs.religion" class="form-input"
+                                placeholder="e.g., Hindu">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Caste</label>
-                            <input type="text" name="caste" class="form-input" placeholder="e.g., Brahmin">
+                            <input type="text" ng-model="searchPrefs.caste" class="form-input"
+                                placeholder="e.g., Brahmin">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Education</label>
-                            <input type="text" name="education" class="form-input" placeholder="e.g., MBA, Engineer">
+                            <input type="text" ng-model="searchPrefs.education" class="form-input"
+                                placeholder="e.g., MBA, Engineer">
                         </div>
                         <div class="form-group">
                             <label class="form-label">Location</label>
-                            <input type="text" name="location" class="form-input" placeholder="e.g., Mumbai">
+                            <input type="text" ng-model="searchPrefs.location" class="form-input"
+                                placeholder="e.g., Mumbai">
                         </div>
                         <div class="form-group" style="display: flex; align-items: flex-end;">
                             <button type="submit" class="btn btn-primary" style="width: 100%;">
@@ -178,29 +423,155 @@
                 </div>
 
                 <!-- Search by Upload -->
-                <div id="uploadTab" class="tab-content">
+                <div id="uploadTab" class="tab-content" ng-class="{active: searchTab === 'upload'}">
                     <div style="text-align: center; padding: 2rem;">
-                        <p style="margin-bottom: 1rem; color: var(--text-secondary);">
+                        <p class="text-muted" style="margin-bottom: 1rem;">
                             Upload a biodata to find matching profiles
                         </p>
                         <input type="file" id="searchFileInput" accept=".pdf,.png,.jpg,.jpeg"
-                               style="margin-bottom: 1rem;">
+                            style="margin-bottom: 1rem;">
                         <br>
-                        <button class="btn btn-primary" onclick="searchByUpload()">
+                        <button class="btn btn-primary" ng-click="searchByUpload()">
                             🔍 Find Matches
                         </button>
+                    </div>
+                </div>
+
+                <!-- Graph View -->
+                <div id="graphTab" class="tab-content" ng-class="{active: searchTab === 'graph'}">
+                    <div style="padding: 1rem;">
+                        <p class="text-muted" style="margin-bottom: 1rem;">
+                            Explore biodata relationships and connections in graph form
+                        </p>
+                        <div style="margin-bottom: 1rem;">
+                            <button class="btn btn-primary" ng-click="loadGraphData()">
+                                🔄 Load Graph
+                            </button>
+                            <button class="btn btn-secondary" ng-click="loadGraphStats()" style="margin-left: 0.5rem;">
+                                📊 Stats
+                            </button>
+                        </div>
+                        <div id="graphStats" ng-if="graphStats" style="margin-bottom: 1rem;">
+                            <div class="stats-grid">
+                                <div class="stat-card">
+                                    <div class="stat-value">{{graphStats.persons || 0}}</div>
+                                    <div class="stat-label">Persons</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-value">{{graphStats.similarities || 0}}</div>
+                                    <div class="stat-label">Connections</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-value">{{graphStats.religions || 0}}</div>
+                                    <div class="stat-label">Religions</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-value">{{graphStats.castes || 0}}</div>
+                                    <div class="stat-label">Castes</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="graphContainer" style="height: 600px; border: 1px solid #ddd; border-radius: 8px;">
+                            <div class="empty-state" ng-if="!graphData || graphData.nodes.length === 0">
+                                <span class="empty-state-icon">🕸️</span>
+                                <div class="empty-state-text">No graph data loaded</div>
+                                <p class="text-muted">Click "Load Graph" to visualize biodata relationships</p>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
 
             <div class="card">
                 <div class="card-header">
-                    <h2 class="card-title">Search Results</h2>
+                    <h2 class="card-title">💞 Search Results</h2>
                 </div>
                 <div id="searchResults">
-                    <div class="empty-state">
-                        <div class="empty-state-icon">🔍</div>
+                    <div class="empty-state" ng-if="isSearching">
+                        <div class="spinner"></div>
+                        <p class="text-muted mt-2">Searching for matches...</p>
+                    </div>
+
+                    <div class="empty-state" ng-if="!isSearching && searchResults.length === 0 && !hasSearched">
+                        <span class="empty-state-icon">🔍</span>
                         <div class="empty-state-text">Enter search criteria and click Search</div>
+                    </div>
+
+                    <div class="empty-state" ng-if="!isSearching && searchResults.length === 0 && hasSearched">
+                        <span class="empty-state-icon">💔</span>
+                        <div class="empty-state-text">No matches found</div>
+                        <p class="text-muted">Try adjusting your search criteria</p>
+                    </div>
+
+                    <div class="match-grid" ng-if="!isSearching && searchResults.length > 0">
+                        <div class="match-card" ng-repeat="match in searchResults">
+                            <div class="match-card-header">
+                                <div class="match-score">{{match.similarity_score * 100 | number:0}}%</div>
+                                <div class="match-score-label">Match Score</div>
+                            </div>
+                            <div class="match-card-body">
+                                <div class="match-detail">
+                                    <span class="match-detail-label">Name</span>
+                                    <span class="match-detail-value">{{match.biodata.name || '-'}}</span>
+                                </div>
+                                <div class="match-detail">
+                                    <span class="match-detail-label">Age</span>
+                                    <span class="match-detail-value">{{match.biodata.age || '-'}}</span>
+                                </div>
+                                <div class="match-detail">
+                                    <span class="match-detail-label">Education</span>
+                                    <span class="match-detail-value">{{match.biodata.education || '-'}}</span>
+                                </div>
+                                <div class="match-detail">
+                                    <span class="match-detail-label">Occupation</span>
+                                    <span class="match-detail-value">{{match.biodata.occupation || '-'}}</span>
+                                </div>
+                                <div class="match-detail">
+                                    <span class="match-detail-label">Location</span>
+                                    <span class="match-detail-value">{{match.biodata.current_city || match.biodata.state
+                                        || '-'}}</span>
+                                </div>
+                                <div class="match-reasons" ng-if="match.match_reasons.length > 0">
+                                    <div class="match-reasons-title">Match Reasons:</div>
+                                    <div class="match-reason-item" ng-repeat="reason in match.match_reasons">✓
+                                        {{reason}}</div>
+                                </div>
+                                <button class="btn btn-primary btn-sm" style="margin-top: 1rem; width: 100%;"
+                                    ng-click="viewBiodata(match.biodata.id)">
+                                    View Full Profile
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+        </section>
+
+        <!-- Graph View Page -->
+        <section id="graphPage" class="page-section" ng-show="currentPage === 'graph'">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">🕸️ Network Graph</h2>
+                    <button class="btn btn-primary" ng-click="loadGraphData()">
+                        ↻ Refresh Graph
+                    </button>
+                    <button class="btn btn-secondary" ng-click="showGraphStats = !showGraphStats">
+                        📊 Toggle Stats
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div id="network-container"
+                        style="height: 600px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: #f8f9fa;">
+                    </div>
+                    <div style="margin-top: 10px; text-align: center;">
+                        <span class="badge" style="background: #e3f2fd; color: #1976d2; margin-right: 10px;">👤
+                            Person</span>
+                        <span class="badge" style="background: #e8f5e9; color: #388e3c; margin-right: 10px;">🏙️
+                            City</span>
+                        <span class="badge" style="background: #fff3e0; color: #f57c00; margin-right: 10px;">🎓
+                            Education</span>
+                        <span class="badge" style="background: #f3e5f5; color: #7b1fa2;">💼 Occupation</span>
                     </div>
                 </div>
             </div>
@@ -208,50 +579,75 @@
     </main>
 
     <!-- View Biodata Modal -->
-    <div id="biodataModal" class="modal-overlay" onclick="if(event.target === this) closeModal('biodataModal')">
-        <div class="modal">
+    <div id="biodataModal" class="modal-overlay" ng-class="{active: showBiodataModal}"
+        ng-click="closeBiodataModal($event)">
+        <div class="modal" ng-click="$event.stopPropagation()">
             <div class="modal-header">
-                <h3 class="modal-title">Biodata Details</h3>
-                <button class="modal-close" onclick="closeModal('biodataModal')">&times;</button>
+                <h3 class="modal-title">💍 Biodata Details</h3>
+                <button class="modal-close" ng-click="showBiodataModal = false">&times;</button>
             </div>
-            <div class="modal-body" id="modalContent">
+            <div class="modal-body" ng-if="selectedBiodata">
+                <div style="margin-bottom: 1rem;">
+                    <span class="badge badge-{{selectedBiodata.ocr_status}}">{{selectedBiodata.ocr_status}}</span>
+                    <span style="margin-left: 1rem;">Confidence: {{(selectedBiodata.ocr_confidence || 0) * 100 |
+                        number:0}}%</span>
+                </div>
+                <div class="form-row">
+                    <div class="validation-field" ng-repeat="field in allFields" ng-if="selectedBiodata[field.key]">
+                        <span class="validation-field-label">{{field.label}}</span>
+                        <span class="validation-field-value">{{selectedBiodata[field.key] || '-'}}</span>
+                    </div>
+                </div>
             </div>
             <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeModal('biodataModal')">Close</button>
+                <a ng-if="selectedBiodata.file_path" href="{{getFileUrl(selectedBiodata.file_path)}}" target="_blank"
+                    class="btn btn-primary" style="text-decoration: none; margin-right: auto;">
+                    📄 View PDF
+                </a>
+                <button class="btn btn-secondary" ng-click="showBiodataModal = false">Close</button>
             </div>
         </div>
     </div>
 
     <!-- Edit Biodata Modal -->
-    <div id="editModal" class="modal-overlay" onclick="if(event.target === this) closeModal('editModal')">
-        <div class="modal">
+    <div id="editModal" class="modal-overlay" ng-class="{active: showEditModal}" ng-click="closeEditModal($event)">
+        <div class="modal" ng-click="$event.stopPropagation()">
             <div class="modal-header">
-                <h3 class="modal-title">Edit Biodata</h3>
-                <button class="modal-close" onclick="closeModal('editModal')">&times;</button>
+                <h3 class="modal-title">✏️ Edit Biodata</h3>
+                <button class="modal-close" ng-click="showEditModal = false">&times;</button>
             </div>
-            <div class="modal-body" id="editModalContent">
+            <div class="modal-body" ng-if="editingBiodata">
+                <form id="editForm">
+                    <div class="form-row">
+                        <div class="form-group" ng-repeat="field in editFields">
+                            <label class="form-label">{{field.label}}</label>
+                            <select ng-if="field.type === 'select'" class="form-select"
+                                ng-model="editingBiodata[field.key]">
+                                <option value="">Select...</option>
+                                <option ng-repeat="opt in field.options" value="{{opt}}">{{opt}}</option>
+                            </select>
+                            <input ng-if="field.type !== 'select'" type="{{field.type || 'text'}}" class="form-input"
+                                ng-model="editingBiodata[field.key]">
+                        </div>
+                    </div>
+                </form>
             </div>
             <div class="modal-footer">
-                <button class="btn btn-secondary" onclick="closeModal('editModal')">Cancel</button>
-                <button class="btn btn-success" onclick="saveEditAndApprove()">Save & Approve</button>
+                <button class="btn btn-secondary" ng-click="showEditModal = false">Cancel</button>
+                <button class="btn btn-success" ng-click="saveEditAndApprove()">Save & Approve</button>
             </div>
         </div>
     </div>
 
     <!-- Toast Container -->
-    <div id="toastContainer" class="toast-container"></div>
+    <div id="toastContainer" class="toast-container">
+        <div class="toast toast-{{toast.type}}" ng-repeat="toast in toasts">
+            {{toast.message}}
+        </div>
+    </div>
 
-    <script>
-        function switchSearchTab(tab) {
-            // Update tab buttons
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            event.target.classList.add('active');
-
-            // Update tab content
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.getElementById(tab + 'Tab').classList.add('active');
-        }
-    </script>
-    <script src="/static/js/app.js"></script>
+    <!-- AngularJS Application -->
+    <script src="/static/js/app.js?v=2"></script>
 </body>
+
 </html>
