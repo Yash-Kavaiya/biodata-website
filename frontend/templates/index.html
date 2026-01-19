@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Biodata Management System</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="navbar-content">
+            <a href="/" class="logo">Biodata Manager</a>
+            <ul class="nav-links">
+                <li><a href="#" data-page="upload" class="active">Upload</a></li>
+                <li><a href="#" data-page="validation">Validation</a></li>
+                <li><a href="#" data-page="biodatas">All Biodatas</a></li>
+                <li><a href="#" data-page="search">Find Match</a></li>
+            </ul>
+        </div>
+    </nav>
+
+    <main class="container">
+        <!-- Upload Page -->
+        <section id="uploadPage" class="page-section active">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Upload Biodata</h2>
+                    <span style="color: var(--text-secondary);">Single or bulk upload supported</span>
+                </div>
+
+                <div id="uploadArea" class="upload-area">
+                    <div class="upload-icon">📄</div>
+                    <div class="upload-text">
+                        <strong>Click to upload</strong> or drag and drop
+                    </div>
+                    <div class="upload-hint">
+                        PDF, PNG, JPG (max 10MB per file)
+                    </div>
+                </div>
+
+                <input type="file" id="fileInput" multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;">
+
+                <div id="uploadQueue" class="upload-queue"></div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">How it works</h2>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem;">
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">1️⃣</div>
+                        <strong>Upload</strong>
+                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Upload biodata PDF or image files</p>
+                    </div>
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">2️⃣</div>
+                        <strong>OCR Processing</strong>
+                        <p style="color: var(--text-secondary); font-size: 0.875rem;">LLM extracts information automatically</p>
+                    </div>
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">3️⃣</div>
+                        <strong>Validate</strong>
+                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Review and approve extracted data</p>
+                    </div>
+                    <div style="text-align: center; padding: 1rem;">
+                        <div style="font-size: 2rem; margin-bottom: 0.5rem;">4️⃣</div>
+                        <strong>Match</strong>
+                        <p style="color: var(--text-secondary); font-size: 0.875rem;">Find compatible profiles</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Validation Page -->
+        <section id="validationPage" class="page-section">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">OCR Validation</h2>
+                    <div class="btn-group">
+                        <input type="number" id="autoApproveConfidence" class="form-input"
+                               style="width: 100px;" placeholder="0.7" min="0" max="1" step="0.1" value="0.7">
+                        <button class="btn btn-success" onclick="autoApproveAll()">
+                            Auto-Approve All
+                        </button>
+                    </div>
+                </div>
+                <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                    Review OCR results and approve, edit, or reject extracted biodata.
+                </p>
+            </div>
+
+            <div id="validationList">
+                <div class="empty-state">
+                    <div class="spinner"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- All Biodatas Page -->
+        <section id="biodatasPage" class="page-section">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">All Biodatas</h2>
+                    <button class="btn btn-primary" onclick="loadBiodatas()">
+                        ↻ Refresh
+                    </button>
+                </div>
+
+                <div id="biodataTable">
+                    <div class="empty-state">
+                        <div class="spinner"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Search/Match Page -->
+        <section id="searchPage" class="page-section">
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Find Your Perfect Match</h2>
+                </div>
+
+                <div id="searchStats"></div>
+
+                <!-- Tabs -->
+                <div class="tabs">
+                    <button class="tab active" onclick="switchSearchTab('preferences')">Search by Preferences</button>
+                    <button class="tab" onclick="switchSearchTab('upload')">Search by Upload</button>
+                </div>
+
+                <!-- Search by Preferences -->
+                <div id="preferencesTab" class="tab-content active">
+                    <form id="searchForm" class="search-form">
+                        <div class="form-group">
+                            <label class="form-label">Gender</label>
+                            <select name="gender" class="form-select">
+                                <option value="">Any</option>
+                                <option value="male">Male</option>
+                                <option value="female">Female</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Min Age</label>
+                            <input type="number" name="min_age" class="form-input" placeholder="18" min="18">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Max Age</label>
+                            <input type="number" name="max_age" class="form-input" placeholder="60" max="100">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Religion</label>
+                            <input type="text" name="religion" class="form-input" placeholder="e.g., Hindu">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Caste</label>
+                            <input type="text" name="caste" class="form-input" placeholder="e.g., Brahmin">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Education</label>
+                            <input type="text" name="education" class="form-input" placeholder="e.g., MBA, Engineer">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Location</label>
+                            <input type="text" name="location" class="form-input" placeholder="e.g., Mumbai">
+                        </div>
+                        <div class="form-group" style="display: flex; align-items: flex-end;">
+                            <button type="submit" class="btn btn-primary" style="width: 100%;">
+                                🔍 Search Matches
+                            </button>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Search by Upload -->
+                <div id="uploadTab" class="tab-content">
+                    <div style="text-align: center; padding: 2rem;">
+                        <p style="margin-bottom: 1rem; color: var(--text-secondary);">
+                            Upload a biodata to find matching profiles
+                        </p>
+                        <input type="file" id="searchFileInput" accept=".pdf,.png,.jpg,.jpeg"
+                               style="margin-bottom: 1rem;">
+                        <br>
+                        <button class="btn btn-primary" onclick="searchByUpload()">
+                            🔍 Find Matches
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title">Search Results</h2>
+                </div>
+                <div id="searchResults">
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🔍</div>
+                        <div class="empty-state-text">Enter search criteria and click Search</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- View Biodata Modal -->
+    <div id="biodataModal" class="modal-overlay" onclick="if(event.target === this) closeModal('biodataModal')">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title">Biodata Details</h3>
+                <button class="modal-close" onclick="closeModal('biodataModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="modalContent">
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('biodataModal')">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Biodata Modal -->
+    <div id="editModal" class="modal-overlay" onclick="if(event.target === this) closeModal('editModal')">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title">Edit Biodata</h3>
+                <button class="modal-close" onclick="closeModal('editModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="editModalContent">
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('editModal')">Cancel</button>
+                <button class="btn btn-success" onclick="saveEditAndApprove()">Save & Approve</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script>
+        function switchSearchTab(tab) {
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.getElementById(tab + 'Tab').classList.add('active');
+        }
+    </script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
