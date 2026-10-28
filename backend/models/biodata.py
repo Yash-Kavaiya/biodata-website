@@ -2,11 +2,15 @@
 Biodata models - Pydantic schemas for data validation.
 Follows Single Responsibility Principle.
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import uuid
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Gender(str, Enum):
@@ -103,12 +107,11 @@ class BiodataInDB(BiodataBase):
     ocr_status: OCRStatus = OCRStatus.PENDING
     ocr_confidence: Optional[float] = None
     raw_ocr_text: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
     is_approved: bool = False
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class BiodataResponse(BiodataInDB):
@@ -122,6 +125,7 @@ class BiodataListResponse(BaseModel):
     items: List[BiodataResponse]
     page: int = 1
     page_size: int = 10
+    pages: int = 1
 
 
 class UploadResponse(BaseModel):
@@ -138,13 +142,6 @@ class BulkUploadResponse(BaseModel):
     successful: int
     failed: int
     uploads: List[UploadResponse]
-
-
-class OCRValidationRequest(BaseModel):
-    """Request for validating/updating OCR results."""
-    biodata_id: str
-    action: str  # "approve", "reject", "edit", "re-ocr"
-    updated_data: Optional[BiodataUpdate] = None
 
 
 class SearchPreferences(BaseModel):

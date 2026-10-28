@@ -1,280 +1,207 @@
 """
 Database Service - JSON-based local database.
-Follows Single Responsibility and Interface Segregation principles.
-Optimized with in-memory caching and O(1) lookups.
+Thread-safe, with an in-memory cache and an id -> position index for O(1) lookups.
 """
 import json
 import os
-from pathlib import Path
-from typing import List, Optional, Dict, Any
-from datetime import datetime
 import threading
-import asyncio
-from contextlib import contextmanager
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.config import settings
-from backend.models import BiodataInDB, OCRStatus
+from backend.models import BiodataInDB, OCRStatus, utcnow
+
+# Fields searched by the free-text `q` filter
+_TEXT_SEARCH_FIELDS = (
+    "name", "education", "occupation", "current_city", "state",
+    "native_place", "religion", "caste", "original_filename",
+)
 
 
 class JSONDatabase:
     """
     JSON file-based database for biodata storage.
-    Thread-safe implementation with in-memory caching for O(1) lookups.
+
+    The cached list is never reordered in place: `_index` maps ids to list
+    positions, so any in-place sort would silently point lookups at the wrong record.
     """
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or (settings.DB_DIR / "biodata.json")
-        self._lock = threading.Lock()
-        # In-memory cache for O(1) lookups
+        self._lock = threading.RLock()
         self._cache: Optional[Dict[str, Any]] = None
-        self._index: Dict[str, int] = {}  # id -> index mapping
-        self._cache_valid = False
+        self._index: Dict[str, int] = {}
         self._ensure_db_exists()
 
     def _ensure_db_exists(self):
         """Create database file if it doesn't exist."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.db_path.exists():
-            self._write_data({"biodatas": [], "metadata": {"version": "1.0", "created_at": datetime.utcnow().isoformat()}})
-
-    @contextmanager
-    def _file_lock(self, timeout=2.0):
-        """Thread-safe file access context manager with retry."""
-        acquired = self._lock.acquire(timeout=timeout)
-        if not acquired:
-            # Fallback or simple blocking if timeout fails logic
-            # For simplicity in this context, we just block if timeout provided is small, 
-            # OR we try-except in the caller. But here we force wait with retry loop is better?
-            # Actually, standard Lock.acquire(timeout) returns bool.
-            # If we fail, we raise specific error.
-            raise TimeoutError("Database lock could not be acquired.")
-        
-        try:
-            yield
-        finally:
-            self._lock.release()
+            self._write_data({"biodatas": [], "metadata": {"version": "1.0", "created_at": utcnow().isoformat()}})
 
     def _read_data(self) -> Dict[str, Any]:
-        """Read all data from JSON file with caching."""
-        if self._cache_valid and self._cache is not None:
+        """Read all data from JSON file (cached after first read)."""
+        if self._cache is not None:
             return self._cache
         try:
             with open(self.db_path, "r", encoding="utf-8") as f:
                 self._cache = json.load(f)
-                self._rebuild_index()
-                self._cache_valid = True
-                return self._cache
         except (json.JSONDecodeError, FileNotFoundError):
             self._cache = {"biodatas": [], "metadata": {"version": "1.0"}}
-            self._index = {}
-            self._cache_valid = True
-            return self._cache
+        self._rebuild_index()
+        return self._cache
 
     def _rebuild_index(self):
-        """Rebuild the id -> index mapping for O(1) lookups."""
-        self._index = {}
-        if self._cache:
-            for i, item in enumerate(self._cache.get("biodatas", [])):
-                if item.get("id"):
-                    self._index[item["id"]] = i
+        """Rebuild the id -> position mapping."""
+        self._index = {
+            item["id"]: i
+            for i, item in enumerate(self._cache.get("biodatas", []))
+            if item.get("id")
+        }
 
     def _write_data(self, data: Dict[str, Any]):
-        """Write data to JSON file and update cache."""
-        with open(self.db_path, "w", encoding="utf-8") as f:
+        """Atomically write data to the JSON file and refresh the cache."""
+        tmp_path = self.db_path.with_suffix(".json.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+        os.replace(tmp_path, self.db_path)
         self._cache = data
         self._rebuild_index()
-        self._cache_valid = True
+
+    def _items(self) -> List[Dict[str, Any]]:
+        return self._read_data().setdefault("biodatas", [])
+
+    @staticmethod
+    def _serialize(biodata: BiodataInDB) -> Dict[str, Any]:
+        return biodata.model_dump(mode="json")
 
     async def create(self, biodata: BiodataInDB) -> BiodataInDB:
-        """
-        Create a new biodata record.
-
-        Args:
-            biodata: BiodataInDB model instance
-
-        Returns:
-            Created biodata with ID
-        """
-        with self._file_lock():
+        """Create a new biodata record."""
+        with self._lock:
             data = self._read_data()
-            biodata_dict = biodata.model_dump()
-            biodata_dict["created_at"] = datetime.utcnow().isoformat()
-            biodata_dict["updated_at"] = datetime.utcnow().isoformat()
-            data["biodatas"].append(biodata_dict)
+            now = utcnow()
+            biodata.created_at = now
+            biodata.updated_at = now
+            data.setdefault("biodatas", []).append(self._serialize(biodata))
             self._write_data(data)
-            return BiodataInDB(**biodata_dict)
+            return biodata
 
     async def get_by_id(self, biodata_id: str) -> Optional[BiodataInDB]:
-        """
-        Get biodata by ID using O(1) index lookup.
-
-        Args:
-            biodata_id: Unique identifier
-
-        Returns:
-            BiodataInDB or None if not found
-        """
-        with self._file_lock():
-            data = self._read_data()
-            # O(1) lookup via index
-            if biodata_id in self._index:
-                idx = self._index[biodata_id]
-                biodatas = data.get("biodatas", [])
-                if idx < len(biodatas):
-                    return BiodataInDB(**biodatas[idx])
-            return None
+        """Get biodata by ID."""
+        with self._lock:
+            items = self._items()
+            idx = self._index.get(biodata_id)
+            if idx is None:
+                return None
+            return BiodataInDB(**items[idx])
 
     async def get_all(
         self,
         page: int = 1,
         page_size: int = 10,
-        status_filter: Optional[OCRStatus] = None
-    ) -> tuple[List[BiodataInDB], int]:
+        status_filter: Optional[OCRStatus] = None,
+        query: Optional[str] = None,
+    ) -> Tuple[List[BiodataInDB], int]:
         """
-        Get all biodatas with pagination.
+        Get biodatas with pagination, newest first.
 
         Args:
             page: Page number (1-indexed)
             page_size: Items per page
             status_filter: Optional OCR status filter
+            query: Optional case-insensitive text filter over common fields
 
         Returns:
-            Tuple of (list of biodatas, total count)
+            Tuple of (list of biodatas, total matching count)
         """
-        with self._file_lock():
-            data = self._read_data()
-            biodatas = data.get("biodatas", [])
-
-            # Apply status filter
+        with self._lock:
+            items = self._items()
             if status_filter:
-                biodatas = [b for b in biodatas if b.get("ocr_status") == status_filter.value]
-
-            total = len(biodatas)
-
-            # Sort by created_at descending
-            biodatas.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-
-            # Apply pagination
+                items = [b for b in items if b.get("ocr_status") == status_filter.value]
+            if query:
+                needle = query.lower().strip()
+                items = [
+                    b for b in items
+                    if any(needle in str(b.get(f) or "").lower() for f in _TEXT_SEARCH_FIELDS)
+                ]
+            # sorted() returns a copy; never sort the cached list in place
+            items = sorted(items, key=lambda x: str(x.get("created_at", "")), reverse=True)
             start = (page - 1) * page_size
-            end = start + page_size
-            paginated = biodatas[start:end]
+            return [BiodataInDB(**item) for item in items[start:start + page_size]], len(items)
 
-            return [BiodataInDB(**item) for item in paginated], total
+    async def list_all(self) -> List[BiodataInDB]:
+        """Get every biodata record (unpaginated)."""
+        with self._lock:
+            return [BiodataInDB(**item) for item in self._items()]
 
     async def update(self, biodata_id: str, update_data: Dict[str, Any]) -> Optional[BiodataInDB]:
         """
-        Update biodata by ID using O(1) index lookup.
-
-        Args:
-            biodata_id: Unique identifier
-            update_data: Dictionary of fields to update
-
-        Returns:
-            Updated BiodataInDB or None if not found
+        Update biodata fields by ID. Every key in `update_data` is applied,
+        including explicit None values (which clear the field).
         """
-        with self._file_lock():
+        with self._lock:
             data = self._read_data()
-            # O(1) lookup via index
-            if biodata_id not in self._index:
+            idx = self._index.get(biodata_id)
+            if idx is None:
                 return None
-            idx = self._index[biodata_id]
-            biodatas = data.get("biodatas", [])
-            if idx >= len(biodatas):
-                return None
-            item = biodatas[idx]
-            # Update fields
-            for key, value in update_data.items():
-                if value is not None:
-                    item[key] = value
-            item["updated_at"] = datetime.utcnow().isoformat()
-            data["biodatas"][idx] = item
+            item = dict(data["biodatas"][idx])
+            item.update(update_data)
+            item["updated_at"] = utcnow()
+            # Validate before persisting so a bad value can't corrupt the record
+            validated = BiodataInDB(**item)
+            data["biodatas"][idx] = self._serialize(validated)
             self._write_data(data)
-            return BiodataInDB(**item)
+            return validated
 
     async def delete(self, biodata_id: str) -> bool:
-        """
-        Delete biodata by ID using O(1) index lookup.
-
-        Args:
-            biodata_id: Unique identifier
-
-        Returns:
-            True if deleted, False if not found
-        """
-        with self._file_lock():
+        """Delete biodata by ID."""
+        with self._lock:
             data = self._read_data()
-            # O(1) check if exists
-            if biodata_id not in self._index:
+            idx = self._index.get(biodata_id)
+            if idx is None:
                 return False
-            idx = self._index[biodata_id]
-            biodatas = data.get("biodatas", [])
-            if idx < len(biodatas):
-                del biodatas[idx]
-                self._write_data(data)  # This rebuilds the index
-                return True
-            return False
-
-    async def search(self, query: Dict[str, Any]) -> List[BiodataInDB]:
-        """
-        Search biodatas by multiple criteria.
-
-        Args:
-            query: Dictionary of search criteria
-
-        Returns:
-            List of matching biodatas
-        """
-        with self._file_lock():
-            data = self._read_data()
-            results = []
-
-            for item in data.get("biodatas", []):
-                match = True
-                for key, value in query.items():
-                    if value is None:
-                        continue
-                    item_value = item.get(key)
-                    if item_value is None:
-                        match = False
-                        break
-                    # Case-insensitive string comparison
-                    if isinstance(value, str) and isinstance(item_value, str):
-                        if value.lower() not in item_value.lower():
-                            match = False
-                            break
-                    # Exact match for other types
-                    elif item_value != value:
-                        match = False
-                        break
-
-                if match:
-                    results.append(BiodataInDB(**item))
-
-            return results
+            del data["biodatas"][idx]
+            self._write_data(data)
+            return True
 
     async def get_approved_biodatas(self) -> List[BiodataInDB]:
-        """Get all approved biodatas for similarity matching."""
-        with self._file_lock():
-            data = self._read_data()
-            approved = [
+        """Get all approved biodatas for matching."""
+        with self._lock:
+            return [
                 BiodataInDB(**item)
-                for item in data.get("biodatas", [])
-                if item.get("is_approved") or item.get("ocr_status") == "approved"
+                for item in self._items()
+                if item.get("is_approved") or item.get("ocr_status") == OCRStatus.APPROVED.value
             ]
-            return approved
 
     async def get_pending_validation(self) -> List[BiodataInDB]:
-        """Get biodatas pending OCR validation."""
-        with self._file_lock():
-            data = self._read_data()
-            pending = [
-                BiodataInDB(**item)
-                for item in data.get("biodatas", [])
-                if item.get("ocr_status") in ["completed", "pending"]
-                and not item.get("is_approved")
+        """Get biodatas awaiting review (including failed re-OCR attempts), oldest first."""
+        reviewable = {OCRStatus.PENDING.value, OCRStatus.COMPLETED.value, OCRStatus.FAILED.value}
+        with self._lock:
+            items = [
+                item for item in self._items()
+                if item.get("ocr_status") in reviewable and not item.get("is_approved")
             ]
-            return pending
+            items = sorted(items, key=lambda x: str(x.get("created_at", "")))
+            return [BiodataInDB(**item) for item in items]
+
+    async def recover_interrupted(self) -> int:
+        """Mark records left in PROCESSING by a crash/restart as FAILED so they can be retried."""
+        with self._lock:
+            data = self._read_data()
+            stuck = [b for b in data.get("biodatas", []) if b.get("ocr_status") == OCRStatus.PROCESSING.value]
+            for item in stuck:
+                item["ocr_status"] = OCRStatus.FAILED.value
+                item["updated_at"] = utcnow().isoformat()
+            if stuck:
+                self._write_data(data)
+            return len(stuck)
+
+    async def status_counts(self) -> Dict[str, int]:
+        """Count records by OCR status."""
+        with self._lock:
+            counts = Counter(item.get("ocr_status", "unknown") for item in self._items())
+            return {"total": sum(counts.values()), **counts}
 
 
 # Singleton database instance

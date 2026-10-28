@@ -4,650 +4,575 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Biodata Manager - Find Your Perfect Match</title>
-    <meta name="description" content="Elegant biodata management system for matrimonial profiles">
+    <title>Biodata Manager</title>
+    <meta name="description" content="Upload, review and match matrimonial biodata profiles">
+    <meta name="theme-color" content="#F8FAFD">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Cpath fill='%234285F4' d='M24 4a20 20 0 0 1 20 20H24z'/%3E%3Cpath fill='%23EA4335' d='M4 24A20 20 0 0 1 24 4v20z'/%3E%3Cpath fill='%23FBBC04' d='M24 44A20 20 0 0 1 4 24h20z'/%3E%3Cpath fill='%2334A853' d='M44 24a20 20 0 0 1-20 20V24z'/%3E%3C/svg%3E">
 
-    <!-- Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link
-        href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;500;600;700&family=Lato:wght@300;400;500;600;700&display=swap"
-        rel="stylesheet">
-
-    <!-- Styles -->
-    <link rel="stylesheet" href="/static/css/styles.css">
-
-    <!-- AngularJS - Multiple CDN fallbacks -->
-    <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.8.3/angular.min.js"></script>
+    <!-- Apply the saved theme before first paint to avoid a flash -->
     <script>
-        // Fallback if Google CDN fails
-        if (typeof angular === 'undefined') {
-            document.write('<script src="https://unpkg.com/angular@1.8.3/angular.min.js"><\/script>');
-        }
+        try {
+            var savedTheme = localStorage.getItem('biodata-theme');
+            if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
+        } catch (e) { }
     </script>
 
-    <!-- Vis.js for graph visualization -->
-    <script src="https://unpkg.com/vis-network@9.1.2/standalone/umd/vis-network.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap">
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,400,0..1,0&display=block">
+    <link rel="stylesheet" href="/static/css/styles.css?v=4">
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.8.3/angular.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
 </head>
 
-<body ng-controller="MainController">
-    <!-- Navigation -->
-    <nav class="navbar">
-        <div class="navbar-content">
-            <a href="/" class="logo">Biodata Manager</a>
-            <ul class="nav-links">
-                <li><a href="#" ng-click="navigateTo('upload')" ng-class="{active: currentPage === 'upload'}">Upload</a>
-                </li>
-                <li><a href="#" ng-click="navigateTo('validation')"
-                        ng-class="{active: currentPage === 'validation'}">Validation</a></li>
-                <li><a href="#" ng-click="navigateTo('biodatas')" ng-class="{active: currentPage === 'biodatas'}">All
-                        Biodatas</a></li>
-                <li><a href="#" ng-click="navigateTo('search')" ng-class="{active: currentPage === 'search'}">Find
-                        Match</a></li>
-                <li><a href="#" ng-click="navigateTo('graph')" ng-class="{active: currentPage === 'graph'}">Graph
-                        View</a></li>
-            </ul>
+<body ng-controller="MainController" close-on-escape="closeModals()" ng-cloak>
+
+    <!-- ==================== TOP APP BAR ==================== -->
+    <header class="app-bar" scroll-elevate>
+        <a href="" class="brand" ng-click="navigateTo('upload')" aria-label="Biodata Manager home">
+            <span class="wordmark"><span>B</span><span>i</span><span>o</span><span>d</span><span>a</span><span>t</span><span>a</span></span>
+            <span class="brand-suffix">Manager</span>
+        </a>
+
+        <form class="search-bar" ng-submit="globalSearch()" role="search">
+            <button type="submit" class="icon-btn state-layer" aria-label="Search">
+                <span class="material-symbols-outlined" aria-hidden="true">search</span>
+            </button>
+            <input type="search" ng-model="list.q" placeholder="Search profiles by name, city, education, caste…" aria-label="Search profiles">
+            <button type="button" class="icon-btn state-layer" ng-if="list.q" ng-click="clearGlobalSearch()" aria-label="Clear search">
+                <span class="material-symbols-outlined" aria-hidden="true">close</span>
+            </button>
+        </form>
+
+        <div class="app-bar-actions">
+            <span class="chip" ng-if="ocrProvider" title="OCR provider">
+                <span class="material-symbols-outlined" aria-hidden="true">auto_awesome</span>{{providerLabel()}}
+            </span>
+            <button class="icon-btn state-layer" ng-click="toggleTheme()" aria-label="Toggle dark theme" title="Toggle theme">
+                <span class="material-symbols-outlined" aria-hidden="true">{{isDark ? 'light_mode' : 'dark_mode'}}</span>
+            </button>
+            <a class="icon-btn state-layer" href="/api/docs" target="_blank" rel="noopener" aria-label="API documentation" title="API docs">
+                <span class="material-symbols-outlined" aria-hidden="true">code</span>
+            </a>
         </div>
-    </nav>
+    </header>
 
-    <main class="container">
-        <!-- Upload Page -->
-        <section id="uploadPage" class="page-section" ng-show="currentPage === 'upload'">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">💒 Upload Biodata</h2>
-                    <span class="text-muted">Single or bulk upload supported</span>
-                </div>
+    <div class="top-progress" ng-if="isLoading || isSearching" role="progressbar" aria-label="Loading"></div>
 
-                <!-- Upload Type Toggle -->
-                <div class="upload-toggle" style="margin-bottom: 1rem; display: flex; gap: 1rem;">
-                    <button class="btn" ng-class="{'btn-primary': uploadType === 'files', 'btn-secondary': uploadType !== 'files'}"
-                        ng-click="uploadType = 'files'">
-                        📄 Upload Files
-                    </button>
-                    <button class="btn" ng-class="{'btn-primary': uploadType === 'folder', 'btn-secondary': uploadType !== 'folder'}"
-                        ng-click="uploadType = 'folder'">
-                        📁 Upload Folder
-                    </button>
-                </div>
+    <div class="app-body">
+        <!-- ==================== NAVIGATION RAIL ==================== -->
+        <nav class="nav-rail" aria-label="Main">
+            <a href="" class="nav-item" ng-repeat="item in navItems" ng-click="navigateTo(item.id)"
+                ng-class="{active: currentPage === item.id}" aria-current="{{currentPage === item.id ? 'page' : undefined}}">
+                <span class="nav-indicator state-layer">
+                    <span class="material-symbols-outlined" aria-hidden="true">{{item.icon}}</span>
+                    <span class="nav-badge" ng-if="item.id === 'validation' && pendingCount() > 0">{{pendingCount() > 999 ? '999+' : pendingCount()}}</span>
+                </span>
+                {{item.label}}
+            </a>
+        </nav>
 
-                <!-- File Upload Area -->
-                <div id="uploadArea" class="upload-area" ng-click="triggerFileInput()"
-                    ng-class="{'drag-over': isDragOver}" ng-dragover="handleDragOver($event)"
-                    ng-dragleave="isDragOver = false" ng-drop="handleDrop($event)"
-                    ng-show="uploadType !== 'folder'">
-                    <span class="upload-icon">📄</span>
-                    <div class="upload-text">
-                        <strong>Click to upload</strong> or drag and drop
-                    </div>
-                    <div class="upload-hint">
-                        PDF, PNG, JPG (max 10MB per file)
+        <main class="content">
+            <!-- ==================== UPLOAD ==================== -->
+            <section class="page" ng-if="currentPage === 'upload'">
+                <div class="page-header">
+                    <div>
+                        <h1>Upload biodata</h1>
+                        <p>Add PDFs or photos. AI reads every field so you only need to review.</p>
                     </div>
                 </div>
 
-                <!-- Folder Upload Area -->
-                <div id="folderUploadArea" class="upload-area" ng-click="triggerFolderInput()"
-                    ng-class="{'drag-over': isDragOver}"
-                    ng-show="uploadType === 'folder'">
-                    <span class="upload-icon">📁</span>
-                    <div class="upload-text">
-                        <strong>Click to select folder</strong>
+                <div class="card card-outlined">
+                    <div class="upload-options">
+                        <div class="segmented" role="group" aria-label="Upload type">
+                            <button type="button" class="state-layer" ng-class="{selected: uploadType === 'files'}" ng-click="uploadType = 'files'">
+                                <span class="material-symbols-outlined" aria-hidden="true">{{uploadType === 'files' ? 'check' : 'description'}}</span>Files
+                            </button>
+                            <button type="button" class="state-layer" ng-class="{selected: uploadType === 'folder'}" ng-click="uploadType = 'folder'">
+                                <span class="material-symbols-outlined" aria-hidden="true">{{uploadType === 'folder' ? 'check' : 'folder'}}</span>Folder
+                            </button>
+                        </div>
+                        <div class="field" ng-if="availableModels.length > 1">
+                            <label for="modelSelect">OCR model</label>
+                            <select id="modelSelect" class="select" ng-model="$parent.$parent.selectedModel"
+                                ng-options="m as (m === defaultModel ? m + ' (default)' : m) for m in availableModels"></select>
+                        </div>
+                        <span class="chip" ng-if="availableModels.length === 1">
+                            <span class="material-symbols-outlined" aria-hidden="true">memory</span>{{availableModels[0]}}
+                        </span>
                     </div>
-                    <div class="upload-hint">
-                        Select a folder containing PDF, PNG, JPG files (up to 200 files)
-                    </div>
-                </div>
 
-                <div class="model-selector">
-                    <label class="form-label">
-                        <span style="font-size: 1.25rem;">🤖</span>
-                        <strong>Gemini Model</strong>
-                    </label>
-                    <select id="modelSelect" class="form-select" ng-model="selectedModel"
-                        ng-options="model as (model === defaultModel ? model + ' (default)' : model) for model in availableModels">
-                    </select>
-                    <p class="text-muted" style="font-size: 0.75rem; margin-top: 0.5rem;">
-                        Select the Vertex AI Gemini model for OCR processing
-                    </p>
-                </div>
-
-                <input type="file" id="fileInput" multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;"
-                    onchange="angular.element(this).scope().handleFileSelect(this.files)">
-
-                <!-- Folder input with webkitdirectory attribute -->
-                <input type="file" id="folderInput" webkitdirectory directory multiple accept=".pdf,.png,.jpg,.jpeg" style="display: none;"
-                    onchange="angular.element(this).scope().handleFolderSelect(this.files)">
-
-                <!-- Batch Job Progress -->
-                <div class="batch-progress" ng-if="batchJob" style="margin: 1rem 0; padding: 1rem; background: var(--neutral-100); border-radius: var(--radius-md);">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
-                        <strong>Batch Upload Progress</strong>
-                        <span class="badge badge-{{batchJob.status}}">{{batchJob.status}}</span>
+                    <div class="drop-zone" ng-show="uploadType === 'files'" ng-click="triggerInput('fileInput')"
+                        ng-class="{'drag-over': isDragOver}" drop-over="handleDragOver()" drop-leave="handleDragLeave()"
+                        drop-files="handleDrop($event)" role="button" tabindex="0" ng-keydown="$event.key === 'Enter' && triggerInput('fileInput')">
+                        <div class="drop-icon"><span class="material-symbols-outlined" aria-hidden="true">upload_file</span></div>
+                        <h2>{{isDragOver ? 'Drop to upload' : 'Drag files here'}}</h2>
+                        <p class="muted">or <a href="" ng-click="$event.preventDefault()">browse your computer</a></p>
+                        <p class="body-small muted">PDF, PNG or JPG · up to {{appInfo.max_file_size_mb || 10}} MB each · {{appInfo.max_bulk_files || 200}} files at a time</p>
                     </div>
-                    <div class="progress-bar" style="background: #e0e0e0; border-radius: 4px; height: 20px; overflow: hidden;">
-                        <div style="background: linear-gradient(90deg, var(--primary-color), var(--accent-color)); height: 100%; transition: width 0.3s;"
-                            ng-style="{width: batchJob.progress_percent + '%'}"></div>
-                    </div>
-                    <div style="display: flex; justify-content: space-between; margin-top: 0.5rem; font-size: 0.875rem;">
-                        <span>{{batchJob.processed}} / {{batchJob.total}} files processed</span>
-                        <span style="color: var(--success-color);">✓ {{batchJob.successful}} success</span>
-                        <span ng-if="batchJob.failed > 0" style="color: var(--error-color);">✕ {{batchJob.failed}} failed</span>
-                        <span>{{batchJob.progress_percent | number:1}}%</span>
-                    </div>
-                    <div ng-if="batchJob.errors && batchJob.errors.length > 0" style="margin-top: 0.5rem; color: var(--error-color); font-size: 0.75rem;">
-                        <div ng-repeat="err in batchJob.errors track by $index">{{err.filename}}: {{err.error}}</div>
-                    </div>
-                </div>
 
-                <div class="upload-queue" ng-if="uploadQueue.length > 0">
-                    <div class="upload-item" ng-repeat="item in uploadQueue">
-                        <div class="upload-item-info">
-                            <div class="upload-item-name">{{item.name}}</div>
-                            <div class="upload-item-status">
-                                <span ng-if="item.status === 'pending'">Waiting...</span>
-                                <span ng-if="item.status === 'uploading'">Uploading...</span>
-                                <span ng-if="item.status === 'completed'">✓ {{item.message || 'Success'}}</span>
-                                <span ng-if="item.status === 'failed'">✕ {{item.error || 'Error'}}</span>
+                    <div class="drop-zone" ng-show="uploadType === 'folder'" ng-click="triggerInput('folderInput')" role="button" tabindex="0"
+                        ng-keydown="$event.key === 'Enter' && triggerInput('folderInput')">
+                        <div class="drop-icon"><span class="material-symbols-outlined" aria-hidden="true">drive_folder_upload</span></div>
+                        <h2>Choose a folder</h2>
+                        <p class="muted">Every PDF, PNG and JPG inside is uploaded</p>
+                    </div>
+
+                    <input type="file" id="fileInput" class="hidden" multiple accept=".pdf,.png,.jpg,.jpeg" file-change="addFiles(files)" file-reset>
+                    <input type="file" id="folderInput" class="hidden" webkitdirectory directory multiple file-change="addFiles(files)" file-reset>
+
+                    <div class="notice" ng-if="ocrProvider === 'local'">
+                        <span class="material-symbols-outlined" aria-hidden="true">warning</span>
+                        <span>No OCR provider is configured (<code>LLM_PROVIDER=local</code>). Files are stored, but no fields are extracted.</span>
+                    </div>
+
+                    <div class="batch" ng-if="batchJob">
+                        <div class="batch-head">
+                            <span class="title">Processing batch</span>
+                            <div class="btn-row">
+                                <span class="chip chip-status status-{{batchJob.status === 'completed' ? 'approved' : batchJob.status}}">{{batchJob.status}}</span>
+                                <button class="btn btn-text btn-sm state-layer" ng-if="batchJob.status === 'processing'" ng-click="cancelBatch()">Cancel</button>
                             </div>
                         </div>
-                        <span class="badge badge-{{item.status}}">{{item.status}}</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">💫 How it works</h2>
-                </div>
-                <div class="how-it-works">
-                    <div class="how-it-works-step">
-                        <span class="step-icon">1️⃣</span>
-                        <strong>Upload</strong>
-                        <p>Upload biodata PDF or image files</p>
-                    </div>
-                    <div class="how-it-works-step">
-                        <span class="step-icon">2️⃣</span>
-                        <strong>OCR Processing</strong>
-                        <p>AI extracts information automatically</p>
-                    </div>
-                    <div class="how-it-works-step">
-                        <span class="step-icon">3️⃣</span>
-                        <strong>Validate</strong>
-                        <p>Review and approve extracted data</p>
-                    </div>
-                    <div class="how-it-works-step">
-                        <span class="step-icon">4️⃣</span>
-                        <strong>Match</strong>
-                        <p>Find compatible profiles</p>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <!-- Validation Page -->
-        <section id="validationPage" class="page-section" ng-show="currentPage === 'validation'">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">✨ OCR Validation</h2>
-                    <div class="btn-group">
-                        <input type="number" ng-model="autoApproveConfidence" class="form-input" style="width: 100px;"
-                            placeholder="0.7" min="0" max="1" step="0.1">
-                        <button class="btn btn-success" ng-click="autoApproveAll()">
-                            Auto-Approve All
-                        </button>
-                    </div>
-                </div>
-                <p class="text-muted">
-                    Review OCR results and approve, edit, or reject extracted biodata.
-                </p>
-            </div>
-
-            <div id="validationList">
-                <div class="empty-state" ng-if="isLoading">
-                    <div class="spinner"></div>
-                </div>
-
-                <div class="empty-state" ng-if="!isLoading && pendingValidation.length === 0">
-                    <span class="empty-state-icon">✅</span>
-                    <div class="empty-state-text">No pending validations</div>
-                    <p class="text-muted">All OCR results have been validated</p>
-                </div>
-
-                <div class="validation-card" ng-repeat="biodata in pendingValidation">
-                    <div class="validation-header">
-                        <div>
-                            <strong>{{biodata.name || 'Unknown'}}</strong>
-                            <span class="badge badge-{{biodata.ocr_status}}"
-                                style="margin-left: 0.5rem;">{{biodata.ocr_status}}</span>
-                        </div>
-                        <div class="confidence-indicator">
-                            <span>Confidence:</span>
-                            <div class="confidence-bar">
-                                <div class="confidence-fill" ng-class="getConfidenceClass(biodata.ocr_confidence)"
-                                    ng-style="{width: (biodata.ocr_confidence || 0) * 100 + '%'}"></div>
-                            </div>
-                            <span>{{(biodata.ocr_confidence || 0) * 100 | number:0}}%</span>
+                        <div class="linear"><div class="linear-fill" ng-style="{width: batchJob.progress_percent + '%'}"></div></div>
+                        <div class="batch-stats">
+                            <span>{{batchJob.processed}} of {{batchJob.total}} files</span>
+                            <span><b>{{batchJob.successful}}</b> succeeded · <b>{{batchJob.failed}}</b> failed</span>
+                            <span>{{batchJob.progress_percent | number:0}}%</span>
                         </div>
                     </div>
-                    <div class="validation-body">
-                        <div class="form-row">
-                            <div class="form-group" ng-repeat="field in validationFields">
-                                <label class="form-label">{{field.label}}</label>
-                                <input type="text" class="form-input" ng-value="biodata[field.key] || ''" readonly>
+
+                    <div ng-if="uploadQueue.length">
+                        <div class="toolbar" style="margin: 20px 0 0;">
+                            <span class="title">{{uploadQueue.length}} file{{uploadQueue.length === 1 ? '' : 's'}}</span>
+                            <span class="spacer"></span>
+                            <button class="btn btn-text state-layer" ng-click="navigateTo('validation')" ng-if="!hasActiveUploads()">
+                                <span class="material-symbols-outlined" aria-hidden="true">fact_check</span>Review results
+                            </button>
+                            <button class="btn btn-text state-layer" ng-click="clearQueue()">Clear</button>
+                        </div>
+                        <div class="file-list">
+                            <div class="file-row" ng-repeat="item in uploadQueue">
+                                <span class="material-symbols-outlined file-icon" aria-hidden="true" ng-class="item.name.toLowerCase().endsWith('.pdf') ? 'pdf' : 'img'">
+                                    {{item.name.toLowerCase().endsWith('.pdf') ? 'picture_as_pdf' : 'image'}}
+                                </span>
+                                <div class="file-info">
+                                    <div class="file-name" title="{{item.path}}">{{item.path}}</div>
+                                    <div class="file-status">{{item.message || (item.status === 'uploading' ? 'Uploading…' : item.status === 'processing' ? 'Reading with AI…' : '')}}</div>
+                                </div>
+                                <div class="spinner sm" ng-if="item.status === 'uploading' || item.status === 'processing'"></div>
+                                <span class="material-symbols-outlined icon-filled" aria-hidden="true" style="color: var(--google-green)" ng-if="item.status === 'completed'">check_circle</span>
+                                <span class="material-symbols-outlined icon-filled" aria-hidden="true" style="color: var(--google-red)" ng-if="item.status === 'failed' || item.status === 'cancelled'">error</span>
                             </div>
                         </div>
                     </div>
-                    <div class="validation-actions">
-                        <a ng-if="biodata.file_path" href="{{getFileUrl(biodata.file_path)}}" target="_blank"
-                            class="btn btn-secondary"
-                            style="text-decoration: none; display: flex; align-items: center; justify-content: center;">
-                            📄 View PDF
-                        </a>
-                        <button class="btn btn-success" ng-click="approveValidation(biodata.id)">
-                            ✓ Approve
-                        </button>
-                        <button class="btn btn-warning" ng-click="editValidation(biodata)">
-                            ✎ Edit & Approve
-                        </button>
-                        <button class="btn btn-secondary" ng-click="rerunOCR(biodata.id)">
-                            ↻ Re-OCR
-                        </button>
-                        <button class="btn btn-danger" ng-click="rejectValidation(biodata.id)">
-                            ✕ Reject
+                </div>
+
+                <div class="card card-outlined">
+                    <div class="steps stagger">
+                        <div class="step"><span class="step-icon"><span class="material-symbols-outlined" aria-hidden="true">upload</span></span><div><h3>Upload</h3><p class="muted">Biodata PDFs or photos, one at a time or in bulk</p></div></div>
+                        <div class="step"><span class="step-icon"><span class="material-symbols-outlined" aria-hidden="true">auto_awesome</span></span><div><h3>AI extraction</h3><p class="muted">AI reads names, family, education and more</p></div></div>
+                        <div class="step"><span class="step-icon"><span class="material-symbols-outlined" aria-hidden="true">fact_check</span></span><div><h3>Review</h3><p class="muted">Check against the document, correct and approve</p></div></div>
+                        <div class="step"><span class="step-icon"><span class="material-symbols-outlined" aria-hidden="true">favorite</span></span><div><h3>Match</h3><p class="muted">Find compatible profiles in seconds</p></div></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- ==================== REVIEW ==================== -->
+            <section class="page" ng-if="currentPage === 'validation'">
+                <div class="page-header">
+                    <div>
+                        <h1>Review</h1>
+                        <p>{{pendingValidation.length}} profile{{pendingValidation.length === 1 ? '' : 's'}} waiting. Compare with the document, then approve, edit or reject.</p>
+                    </div>
+                    <div class="review-toolbar">
+                        <div class="field">
+                            <label for="autoApprove">Min confidence</label>
+                            <input id="autoApprove" type="number" ng-model="$parent.autoApproveConfidence" class="input input-narrow" min="0" max="1" step="0.05">
+                        </div>
+                        <button class="btn btn-tonal state-layer" ng-click="autoApproveAll()" ng-disabled="!pendingValidation.length" style="align-self: flex-end">
+                            <span class="material-symbols-outlined" aria-hidden="true">done_all</span>Auto-approve
                         </button>
                     </div>
                 </div>
-            </div>
-        </section>
 
-        <!-- All Biodatas Page -->
-        <section id="biodatasPage" class="page-section" ng-show="currentPage === 'biodatas'">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">💝 All Biodatas</h2>
-                    <button class="btn btn-primary" ng-click="loadBiodatas()">
-                        ↻ Refresh
+                <div class="empty" ng-if="isLoading && !pendingValidation.length"><div class="spinner"></div></div>
+
+                <div class="card card-outlined" ng-if="!isLoading && !pendingValidation.length">
+                    <div class="empty">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">task_alt</span></div>
+                        <h3>You're all caught up</h3>
+                        <p>Nothing is waiting for review. New uploads will appear here.</p>
+                        <button class="btn btn-filled state-layer" ng-click="navigateTo('upload')"><span class="material-symbols-outlined" aria-hidden="true">upload</span>Upload biodata</button>
+                    </div>
+                </div>
+
+                <div class="stagger">
+                    <article class="review-card" ng-repeat="biodata in pendingValidation | limitTo: reviewLimit track by biodata.id" ng-class="{'is-busy': busy[biodata.id]}">
+                        <div class="review-head">
+                            <span class="avatar" ng-class="biodata.gender || 'unknown'">{{initials(biodata.name)}}</span>
+                            <div class="review-title">
+                                <h3>{{biodata.name || 'Unnamed profile'}}
+                                    <span class="chip chip-status status-{{biodata.ocr_status}}">{{statusLabel(biodata.ocr_status)}}</span>
+                                </h3>
+                                <div class="body-small muted">{{biodata.original_filename}}</div>
+                            </div>
+                            <div class="confidence" ng-class="'conf-' + getConfidenceClass(biodata.ocr_confidence)" title="OCR confidence">
+                                <div class="linear"><div class="linear-fill" ng-style="{width: (biodata.ocr_confidence || 0) * 100 + '%'}"></div></div>
+                                {{(biodata.ocr_confidence || 0) * 100 | number:0}}%
+                            </div>
+                        </div>
+                        <dl class="kv-grid">
+                            <div class="kv" ng-repeat="field in summaryFields">
+                                <dt>{{field.label}}</dt>
+                                <dd ng-class="{'is-empty': !hasValue(biodata[field.key])}">{{hasValue(biodata[field.key]) ? biodata[field.key] : '—'}}</dd>
+                            </div>
+                        </dl>
+                        <div class="review-actions">
+                            <button class="btn btn-filled state-layer" ng-click="approve(biodata)" ng-disabled="busy[biodata.id] || biodata.ocr_status === 'failed'">
+                                <span class="material-symbols-outlined" aria-hidden="true">check</span>Approve
+                            </button>
+                            <button class="btn btn-tonal state-layer" ng-click="editBiodata(biodata)" ng-disabled="busy[biodata.id]">
+                                <span class="material-symbols-outlined" aria-hidden="true">edit</span>Edit &amp; approve
+                            </button>
+                            <a ng-if="biodata.file_path" ng-href="{{fileUrl(biodata)}}" target="_blank" rel="noopener" class="btn btn-text state-layer">
+                                <span class="material-symbols-outlined" aria-hidden="true">open_in_new</span>Document
+                            </a>
+                            <span class="spacer"></span>
+                            <button class="icon-btn state-layer" ng-click="viewBiodata(biodata.id)" title="All fields" aria-label="All fields">
+                                <span class="material-symbols-outlined" aria-hidden="true">visibility</span>
+                            </button>
+                            <button class="icon-btn state-layer" ng-click="rerunOCR(biodata)" ng-disabled="busy[biodata.id] || !biodata.file_path" title="Re-run OCR" aria-label="Re-run OCR">
+                                <span class="material-symbols-outlined" aria-hidden="true" ng-if="!busy[biodata.id]">refresh</span>
+                                <span class="spinner sm" ng-if="busy[biodata.id]"></span>
+                            </button>
+                            <button class="icon-btn state-layer" style="color: var(--md-sys-color-error)" ng-click="reject(biodata)" ng-disabled="busy[biodata.id]" title="Reject" aria-label="Reject">
+                                <span class="material-symbols-outlined" aria-hidden="true">block</span>
+                            </button>
+                        </div>
+                    </article>
+                </div>
+
+                <div class="empty" ng-if="pendingValidation.length > reviewLimit" style="padding: 16px">
+                    <button class="btn btn-outlined state-layer" ng-click="showMoreReviews()">
+                        Show more ({{pendingValidation.length - reviewLimit}} remaining)
                     </button>
                 </div>
+            </section>
 
-                <div id="biodataTable">
-                    <div class="empty-state" ng-if="isLoading">
-                        <div class="spinner"></div>
+            <!-- ==================== PROFILES ==================== -->
+            <section class="page" ng-if="currentPage === 'biodatas'">
+                <div class="page-header">
+                    <div>
+                        <h1>Profiles</h1>
+                        <p>{{counts.total || 0}} profiles · {{counts.approved || 0}} approved</p>
+                    </div>
+                </div>
+
+                <div class="stats stagger">
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">group</span></span><div><div class="stat-value">{{counts.total || 0}}</div><div class="stat-label">Total</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: var(--md-sys-color-tertiary-container); color: var(--md-sys-color-on-tertiary-container)"><span class="material-symbols-outlined" aria-hidden="true">verified</span></span><div><div class="stat-value">{{counts.approved || 0}}</div><div class="stat-label">Approved</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: var(--md-sys-color-warning-container); color: var(--md-sys-color-on-warning-container)"><span class="material-symbols-outlined" aria-hidden="true">pending_actions</span></span><div><div class="stat-value">{{pendingCount()}}</div><div class="stat-label">To review</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: var(--md-sys-color-error-container); color: var(--md-sys-color-on-error-container)"><span class="material-symbols-outlined" aria-hidden="true">block</span></span><div><div class="stat-value">{{counts.rejected || 0}}</div><div class="stat-label">Rejected</div></div></div>
+                </div>
+
+                <div class="card card-outlined">
+                    <div class="toolbar">
+                        <button class="chip chip-filter state-layer" ng-repeat="f in statusFilters" ng-class="{selected: list.status === f.value}" ng-click="setStatusFilter(f.value)">
+                            <span class="material-symbols-outlined" aria-hidden="true" ng-if="list.status === f.value">check</span>{{f.label}}
+                        </button>
+                        <span class="spacer"></span>
+                        <span class="chip" ng-if="list.q">
+                            <span class="material-symbols-outlined" aria-hidden="true">search</span>“{{list.q}}”
+                        </span>
                     </div>
 
-                    <div class="empty-state" ng-if="!isLoading && biodatas.length === 0">
-                        <span class="empty-state-icon">📋</span>
-                        <div class="empty-state-text">No biodatas found</div>
-                        <p class="text-muted">Upload some biodata files to get started</p>
+                    <div class="empty" ng-if="isLoading && !list.items.length"><div class="spinner"></div></div>
+
+                    <div class="empty" ng-if="!isLoading && !list.items.length">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">person_search</span></div>
+                        <h3>No profiles found</h3>
+                        <p>{{list.q || list.status ? 'Try a different search or filter.' : 'Upload some biodata files to get started.'}}</p>
                     </div>
 
-                    <div class="table-container" ng-if="!isLoading && biodatas.length > 0">
-                        <table class="data-table">
+                    <div class="table-wrap" ng-if="list.items.length">
+                        <table class="table">
                             <thead>
                                 <tr>
-                                    <th>Name</th>
-                                    <th>Age</th>
-                                    <th>Gender</th>
-                                    <th>Education</th>
-                                    <th>Location</th>
-                                    <th>Status</th>
-                                    <th>Confidence</th>
-                                    <th>Actions</th>
+                                    <th>Name</th><th>Age</th><th>Education</th><th class="col-optional">Occupation</th><th>Location</th><th>Status</th><th class="col-optional">Confidence</th><th><span class="hidden">Actions</span></th>
                                 </tr>
                             </thead>
                             <tbody>
-                                <tr ng-repeat="biodata in biodatas">
-                                    <td>{{biodata.name || '-'}}</td>
-                                    <td>{{biodata.age || '-'}}</td>
-                                    <td>{{biodata.gender || '-'}}</td>
-                                    <td>{{biodata.education || '-'}}</td>
-                                    <td>{{biodata.current_city || biodata.state || '-'}}</td>
-                                    <td><span class="badge badge-{{biodata.ocr_status}}">{{biodata.ocr_status}}</span>
-                                    </td>
+                                <tr ng-repeat="biodata in list.items track by biodata.id" ng-click="viewBiodata(biodata.id)">
+                                    <td><div class="name-cell"><span class="avatar" ng-class="biodata.gender || 'unknown'">{{initials(biodata.name)}}</span>{{biodata.name || 'Unnamed'}}</div></td>
+                                    <td>{{biodata.age || '—'}}</td>
+                                    <td class="truncate" title="{{biodata.education}}">{{biodata.education || '—'}}</td>
+                                    <td class="truncate col-optional" title="{{biodata.occupation}}">{{biodata.occupation || '—'}}</td>
+                                    <td>{{biodata.current_city || biodata.state || '—'}}</td>
+                                    <td><span class="chip chip-status status-{{biodata.ocr_status}}">{{statusLabel(biodata.ocr_status)}}</span></td>
+                                    <td class="muted col-optional">{{biodata.ocr_confidence === null ? 'Manual' : (biodata.ocr_confidence * 100 | number:0) + '%'}}</td>
                                     <td>
-                                        <div class="confidence-indicator">
-                                            <div class="confidence-bar">
-                                                <div class="confidence-fill"
-                                                    ng-class="getConfidenceClass(biodata.ocr_confidence)"
-                                                    ng-style="{width: (biodata.ocr_confidence || 0) * 100 + '%'}"></div>
-                                            </div>
-                                            <span>{{(biodata.ocr_confidence || 0) * 100 | number:0}}%</span>
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <div class="btn-group">
-                                            <button class="btn btn-sm btn-secondary"
-                                                ng-click="viewBiodata(biodata.id)">View</button>
-                                            <button class="btn btn-sm btn-danger"
-                                                ng-click="deleteBiodata(biodata.id)">Delete</button>
+                                        <div class="row-actions" ng-click="$event.stopPropagation()">
+                                            <button class="icon-btn sm state-layer" ng-click="editBiodata(biodata)" title="Edit" aria-label="Edit"><span class="material-symbols-outlined" aria-hidden="true">edit</span></button>
+                                            <button class="icon-btn sm state-layer" ng-if="biodata.is_approved" ng-click="findMatchesFor(biodata)" title="Find matches" aria-label="Find matches"><span class="material-symbols-outlined" aria-hidden="true">favorite</span></button>
+                                            <button class="icon-btn sm state-layer" ng-click="deleteBiodata(biodata)" title="Delete" aria-label="Delete"><span class="material-symbols-outlined" aria-hidden="true">delete</span></button>
                                         </div>
                                     </td>
                                 </tr>
                             </tbody>
                         </table>
                     </div>
-                    <div ng-if="!isLoading && biodatas.length > 0" style="margin-top: 1rem; text-align: center;"
-                        class="text-muted">
-                        Showing {{biodatas.length}} of {{totalBiodatas}} biodatas
+
+                    <div class="pagination" ng-if="list.total">
+                        <span>{{(list.page - 1) * list.pageSize + 1}}–{{min(list.page * list.pageSize, list.total)}} of {{list.total}}</span>
+                        <button class="icon-btn state-layer" ng-disabled="list.page <= 1" ng-click="loadBiodatas(list.page - 1)" aria-label="Previous page"><span class="material-symbols-outlined" aria-hidden="true">chevron_left</span></button>
+                        <button class="icon-btn state-layer" ng-disabled="list.page >= list.pages" ng-click="loadBiodatas(list.page + 1)" aria-label="Next page"><span class="material-symbols-outlined" aria-hidden="true">chevron_right</span></button>
                     </div>
                 </div>
-            </div>
-        </section>
+            </section>
 
-        <!-- Search/Match Page -->
-        <section id="searchPage" class="page-section" ng-show="currentPage === 'search'">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">💕 Find Your Perfect Match</h2>
-                </div>
-
-                <div id="searchStats" ng-if="searchStats">
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">{{searchStats.total_approved}}</div>
-                            <div class="stat-label">Total Profiles</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{{searchStats.by_gender.male || 0}}</div>
-                            <div class="stat-label">Male Profiles</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{{searchStats.by_gender.female || 0}}</div>
-                            <div class="stat-label">Female Profiles</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{{searchStats.age_range.min || '-'}} - {{searchStats.age_range.max
-                                || '-'}}</div>
-                            <div class="stat-label">Age Range</div>
-                        </div>
+            <!-- ==================== MATCH ==================== -->
+            <section class="page" ng-if="currentPage === 'search'">
+                <div class="page-header">
+                    <div>
+                        <h1>Find a match</h1>
+                        <p>Search {{searchStats.total_approved || 0}} approved profiles by preferences or from a biodata.</p>
                     </div>
                 </div>
 
-                <!-- Tabs -->
-                <div class="tabs">
-                    <button class="tab" ng-class="{active: searchTab === 'preferences'}"
-                        ng-click="searchTab = 'preferences'">Search by Preferences</button>
-                    <button class="tab" ng-class="{active: searchTab === 'upload'}"
-                        ng-click="searchTab = 'upload'">Search by Upload</button>
-                    <button class="tab" ng-class="{active: searchTab === 'graph'}" ng-click="searchTab = 'graph'">Graph
-                        View</button>
+                <div class="stats stagger" ng-if="searchStats">
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">verified</span></span><div><div class="stat-value">{{searchStats.total_approved}}</div><div class="stat-label">Approved profiles</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: color-mix(in srgb, var(--viz-1) 18%, transparent); color: var(--viz-1)"><span class="material-symbols-outlined" aria-hidden="true">man</span></span><div><div class="stat-value">{{searchStats.by_gender.male || 0}}</div><div class="stat-label">Grooms</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: color-mix(in srgb, var(--viz-2) 18%, transparent); color: var(--viz-2)"><span class="material-symbols-outlined" aria-hidden="true">woman</span></span><div><div class="stat-value">{{searchStats.by_gender.female || 0}}</div><div class="stat-label">Brides</div></div></div>
+                    <div class="stat"><span class="stat-icon" style="background: color-mix(in srgb, var(--viz-4) 18%, transparent); color: var(--viz-4)"><span class="material-symbols-outlined" aria-hidden="true">cake</span></span><div><div class="stat-value">{{searchStats.age_range.min || '—'}}–{{searchStats.age_range.max || '—'}}</div><div class="stat-label">Age range</div></div></div>
                 </div>
 
-                <!-- Search by Preferences -->
-                <div id="preferencesTab" class="tab-content" ng-class="{active: searchTab === 'preferences'}">
-                    <form id="searchForm" class="search-form" ng-submit="performSearch()">
-                        <div class="form-group">
-                            <label class="form-label">Gender</label>
-                            <select ng-model="searchPrefs.gender" class="form-select">
-                                <option value="">Any</option>
-                                <option value="male">Male</option>
-                                <option value="female">Female</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Min Age</label>
-                            <input type="number" ng-model="searchPrefs.min_age" class="form-input" placeholder="18"
-                                min="18">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Max Age</label>
-                            <input type="number" ng-model="searchPrefs.max_age" class="form-input" placeholder="60"
-                                max="100">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Religion</label>
-                            <input type="text" ng-model="searchPrefs.religion" class="form-input"
-                                placeholder="e.g., Hindu">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Caste</label>
-                            <input type="text" ng-model="searchPrefs.caste" class="form-input"
-                                placeholder="e.g., Brahmin">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Education</label>
-                            <input type="text" ng-model="searchPrefs.education" class="form-input"
-                                placeholder="e.g., MBA, Engineer">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Location</label>
-                            <input type="text" ng-model="searchPrefs.location" class="form-input"
-                                placeholder="e.g., Mumbai">
-                        </div>
-                        <div class="form-group" style="display: flex; align-items: flex-end;">
-                            <button type="submit" class="btn btn-primary" style="width: 100%;">
-                                🔍 Search Matches
-                            </button>
-                        </div>
-                    </form>
-                </div>
-
-                <!-- Search by Upload -->
-                <div id="uploadTab" class="tab-content" ng-class="{active: searchTab === 'upload'}">
-                    <div style="text-align: center; padding: 2rem;">
-                        <p class="text-muted" style="margin-bottom: 1rem;">
-                            Upload a biodata to find matching profiles
-                        </p>
-                        <input type="file" id="searchFileInput" accept=".pdf,.png,.jpg,.jpeg"
-                            style="margin-bottom: 1rem;">
-                        <br>
-                        <button class="btn btn-primary" ng-click="searchByUpload()">
-                            🔍 Find Matches
+                <div class="card card-outlined">
+                    <div class="tabs" role="tablist">
+                        <button class="tab state-layer" role="tab" ng-class="{active: searchTab === 'preferences'}" ng-click="$parent.searchTab = 'preferences'">
+                            <span class="material-symbols-outlined" aria-hidden="true">tune</span>Preferences
+                        </button>
+                        <button class="tab state-layer" role="tab" ng-class="{active: searchTab === 'upload'}" ng-click="$parent.searchTab = 'upload'">
+                            <span class="material-symbols-outlined" aria-hidden="true">document_scanner</span>From a biodata
                         </button>
                     </div>
-                </div>
 
-                <!-- Graph View -->
-                <div id="graphTab" class="tab-content" ng-class="{active: searchTab === 'graph'}">
-                    <div style="padding: 1rem;">
-                        <p class="text-muted" style="margin-bottom: 1rem;">
-                            Explore biodata relationships and connections in graph form
-                        </p>
-                        <div style="margin-bottom: 1rem;">
-                            <button class="btn btn-primary" ng-click="loadGraphData()">
-                                🔄 Load Graph
+                    <form ng-if="searchTab === 'preferences'" ng-submit="performSearch()">
+                        <div class="form-grid">
+                            <div class="field"><label>Looking for</label>
+                                <select ng-model="searchPrefs.gender" class="select"><option value="">Anyone</option><option value="female">Bride</option><option value="male">Groom</option></select></div>
+                            <div class="field"><label>Min age</label><input type="number" ng-model="searchPrefs.min_age" class="input" placeholder="18" min="18" max="100"></div>
+                            <div class="field"><label>Max age</label><input type="number" ng-model="searchPrefs.max_age" class="input" placeholder="40" min="18" max="100"></div>
+                            <div class="field"><label>Marital status</label>
+                                <select ng-model="searchPrefs.marital_status" class="select"><option value="">Any</option><option value="single">Never married</option><option value="divorced">Divorced</option><option value="widowed">Widowed</option></select></div>
+                            <div class="field"><label>Religion</label><input type="text" ng-model="searchPrefs.religion" class="input" placeholder="e.g. Hindu"></div>
+                            <div class="field"><label>Caste</label><input type="text" ng-model="searchPrefs.caste" class="input" placeholder="e.g. Patel"></div>
+                            <div class="field"><label>Education</label><input type="text" ng-model="searchPrefs.education" class="input" placeholder="e.g. MBA, B.Tech"></div>
+                            <div class="field"><label>Occupation</label><input type="text" ng-model="searchPrefs.occupation" class="input" placeholder="e.g. Engineer"></div>
+                            <div class="field"><label>Location</label><input type="text" ng-model="searchPrefs.location" class="input" placeholder="e.g. Ahmedabad"></div>
+                        </div>
+                        <div class="btn-row" style="margin-top: 24px">
+                            <button type="submit" class="btn btn-filled state-layer" ng-disabled="isSearching"><span class="material-symbols-outlined" aria-hidden="true">search</span>Search</button>
+                            <button type="button" class="btn btn-text state-layer" ng-click="resetSearch()">Reset</button>
+                        </div>
+                    </form>
+
+                    <div ng-if="searchTab === 'upload'" class="drop-zone" style="min-height: 200px; cursor: default">
+                        <div class="drop-icon"><span class="material-symbols-outlined" aria-hidden="true">document_scanner</span></div>
+                        <h2>Match from a biodata</h2>
+                        <p class="muted">AI reads the document and finds compatible profiles. The file isn't stored.</p>
+                        <div class="btn-row" style="justify-content: center; margin-top: 8px">
+                            <button class="btn btn-outlined state-layer" ng-click="triggerInput('searchFileInput')">
+                                <span class="material-symbols-outlined" aria-hidden="true">attach_file</span>{{searchFile ? searchFile.name : 'Choose file'}}
                             </button>
-                            <button class="btn btn-secondary" ng-click="loadGraphStats()" style="margin-left: 0.5rem;">
-                                📊 Stats
+                            <button class="btn btn-filled state-layer" ng-click="searchByUpload()" ng-disabled="isSearching || !searchFile">
+                                <span class="material-symbols-outlined" aria-hidden="true">favorite</span>Find matches
                             </button>
                         </div>
-                        <div id="graphStats" ng-if="graphStats" style="margin-bottom: 1rem;">
-                            <div class="stats-grid">
-                                <div class="stat-card">
-                                    <div class="stat-value">{{graphStats.persons || 0}}</div>
-                                    <div class="stat-label">Persons</div>
+                    </div>
+                    <input type="file" id="searchFileInput" class="hidden" accept=".pdf,.png,.jpg,.jpeg" file-change="setSearchFile(files)">
+                </div>
+
+                <div class="card card-outlined" ng-if="hasSearched || isSearching">
+                    <div class="card-header">
+                        <h2 class="card-title"><span class="material-symbols-outlined" aria-hidden="true">favorite</span>{{searchTitle}}</h2>
+                        <span class="muted" ng-if="!isSearching">{{searchResults.length}} result{{searchResults.length === 1 ? '' : 's'}}</span>
+                    </div>
+
+                    <div class="empty" ng-if="isSearching"><div class="spinner"></div><p>Finding compatible profiles…</p></div>
+
+                    <div class="empty" ng-if="!isSearching && !searchResults.length">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">heart_broken</span></div>
+                        <h3>No matches yet</h3>
+                        <p>Only approved profiles are searched. Try broader criteria or approve more profiles.</p>
+                    </div>
+
+                    <div class="match-grid stagger" ng-if="!isSearching && searchResults.length">
+                        <article class="match-card" ng-repeat="match in searchResults track by match.biodata.id">
+                            <div class="match-top">
+                                <div class="score-ring" style="--score: {{match.similarity_score * 100 | number:0}}" title="Match score">
+                                    <span>{{match.similarity_score * 100 | number:0}}%</span>
                                 </div>
-                                <div class="stat-card">
-                                    <div class="stat-value">{{graphStats.similarities || 0}}</div>
-                                    <div class="stat-label">Connections</div>
-                                </div>
-                                <div class="stat-card">
-                                    <div class="stat-value">{{graphStats.religions || 0}}</div>
-                                    <div class="stat-label">Religions</div>
-                                </div>
-                                <div class="stat-card">
-                                    <div class="stat-value">{{graphStats.castes || 0}}</div>
-                                    <div class="stat-label">Castes</div>
+                                <div class="match-name">
+                                    <h3>{{match.biodata.name || 'Unnamed'}}</h3>
+                                    <div class="muted">{{[match.biodata.age ? match.biodata.age + ' yrs' : null, match.biodata.current_city || match.biodata.state].filter(truthy).join(' · ') || '—'}}</div>
                                 </div>
                             </div>
-                        </div>
-                        <div id="graphContainer" style="height: 600px; border: 1px solid #ddd; border-radius: 8px;">
-                            <div class="empty-state" ng-if="!graphData || graphData.nodes.length === 0">
-                                <span class="empty-state-icon">🕸️</span>
-                                <div class="empty-state-text">No graph data loaded</div>
-                                <p class="text-muted">Click "Load Graph" to visualize biodata relationships</p>
+                            <dl class="match-facts">
+                                <dt><span class="material-symbols-outlined" aria-hidden="true">school</span></dt><dd>{{match.biodata.education || '—'}}</dd>
+                                <dt><span class="material-symbols-outlined" aria-hidden="true">work</span></dt><dd>{{match.biodata.occupation || '—'}}</dd>
+                            </dl>
+                            <div class="chip-row" ng-if="match.match_reasons.length">
+                                <span class="chip chip-reason" ng-repeat="reason in match.match_reasons"><span class="material-symbols-outlined" aria-hidden="true">check</span>{{reason}}</span>
                             </div>
-                        </div>
+                            <button class="btn btn-tonal btn-sm state-layer" ng-click="viewBiodata(match.biodata.id)">View profile</button>
+                        </article>
                     </div>
                 </div>
-            </div>
+            </section>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">💞 Search Results</h2>
+            <!-- ==================== GRAPH ==================== -->
+            <section class="page" ng-if="currentPage === 'graph'">
+                <div class="page-header">
+                    <div>
+                        <h1>Relationship graph</h1>
+                        <p>How approved profiles connect through shared community, place and career.</p>
+                    </div>
+                    <button class="btn btn-tonal state-layer" ng-click="loadGraph()"><span class="material-symbols-outlined" aria-hidden="true">refresh</span>Refresh</button>
                 </div>
-                <div id="searchResults">
-                    <div class="empty-state" ng-if="isSearching">
-                        <div class="spinner"></div>
-                        <p class="text-muted mt-2">Searching for matches...</p>
-                    </div>
 
-                    <div class="empty-state" ng-if="!isSearching && searchResults.length === 0 && !hasSearched">
-                        <span class="empty-state-icon">🔍</span>
-                        <div class="empty-state-text">Enter search criteria and click Search</div>
-                    </div>
+                <div class="stats stagger" ng-if="graphStats.connected">
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">person</span></span><div><div class="stat-value">{{graphStats.persons}}</div><div class="stat-label">People</div></div></div>
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">join</span></span><div><div class="stat-value">{{graphStats.similarities}}</div><div class="stat-label">Similar pairs</div></div></div>
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">temple_hindu</span></span><div><div class="stat-value">{{graphStats.religions}}</div><div class="stat-label">Religions</div></div></div>
+                    <div class="stat"><span class="stat-icon"><span class="material-symbols-outlined" aria-hidden="true">location_on</span></span><div><div class="stat-value">{{graphStats.locations}}</div><div class="stat-label">Locations</div></div></div>
+                </div>
 
-                    <div class="empty-state" ng-if="!isSearching && searchResults.length === 0 && hasSearched">
-                        <span class="empty-state-icon">💔</span>
-                        <div class="empty-state-text">No matches found</div>
-                        <p class="text-muted">Try adjusting your search criteria</p>
+                <div class="card card-outlined">
+                    <div class="empty" ng-if="!graphStats"><div class="spinner"></div></div>
+                    <div class="empty" ng-if="graphStats && !graphStats.configured">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">hub</span></div>
+                        <h3>Graph view is off</h3>
+                        <p>Connect a Neo4j database by setting <code>NEO4J_URI</code>, <code>NEO4J_USERNAME</code> and <code>NEO4J_PASSWORD</code> in <code>.env</code>, then restart.</p>
                     </div>
-
-                    <div class="match-grid" ng-if="!isSearching && searchResults.length > 0">
-                        <div class="match-card" ng-repeat="match in searchResults">
-                            <div class="match-card-header">
-                                <div class="match-score">{{match.similarity_score * 100 | number:0}}%</div>
-                                <div class="match-score-label">Match Score</div>
-                            </div>
-                            <div class="match-card-body">
-                                <div class="match-detail">
-                                    <span class="match-detail-label">Name</span>
-                                    <span class="match-detail-value">{{match.biodata.name || '-'}}</span>
-                                </div>
-                                <div class="match-detail">
-                                    <span class="match-detail-label">Age</span>
-                                    <span class="match-detail-value">{{match.biodata.age || '-'}}</span>
-                                </div>
-                                <div class="match-detail">
-                                    <span class="match-detail-label">Education</span>
-                                    <span class="match-detail-value">{{match.biodata.education || '-'}}</span>
-                                </div>
-                                <div class="match-detail">
-                                    <span class="match-detail-label">Occupation</span>
-                                    <span class="match-detail-value">{{match.biodata.occupation || '-'}}</span>
-                                </div>
-                                <div class="match-detail">
-                                    <span class="match-detail-label">Location</span>
-                                    <span class="match-detail-value">{{match.biodata.current_city || match.biodata.state
-                                        || '-'}}</span>
-                                </div>
-                                <div class="match-reasons" ng-if="match.match_reasons.length > 0">
-                                    <div class="match-reasons-title">Match Reasons:</div>
-                                    <div class="match-reason-item" ng-repeat="reason in match.match_reasons">✓
-                                        {{reason}}</div>
-                                </div>
-                                <button class="btn btn-primary btn-sm" style="margin-top: 1rem; width: 100%;"
-                                    ng-click="viewBiodata(match.biodata.id)">
-                                    View Full Profile
-                                </button>
-                            </div>
+                    <div class="empty" ng-if="graphStats.configured && !graphStats.connected">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">cloud_off</span></div>
+                        <h3>Can't reach Neo4j</h3>
+                        <p>Check the connection settings and the server logs.</p>
+                    </div>
+                    <div class="empty" ng-if="graphStats.connected && graphEmpty">
+                        <div class="empty-icon"><span class="material-symbols-outlined" aria-hidden="true">hub</span></div>
+                        <h3>The graph is empty</h3>
+                        <p>Approved profiles appear here. Load existing ones with <code>POST /api/graph/sync</code>.</p>
+                    </div>
+                    <div ng-show="graphStats.connected && !graphEmpty">
+                        <div id="network-container" class="graph-container"></div>
+                        <div class="legend">
+                            <span><i style="background: var(--viz-1)"></i>Groom</span>
+                            <span><i style="background: var(--viz-2)"></i>Bride</span>
+                            <span><i style="background: var(--viz-3)"></i>Religion</span>
+                            <span><i style="background: var(--viz-4)"></i>Location</span>
+                            <span><i style="background: var(--viz-5)"></i>Education</span>
+                            <span><i style="background: var(--viz-6)"></i>Occupation</span>
+                            <span><i style="background: var(--md-sys-color-outline)"></i>Caste</span>
+                            <span>Dashed line = similar profiles · click a person to open</span>
                         </div>
                     </div>
                 </div>
-            </div>
-        </section>
-        </section>
+            </section>
+        </main>
+    </div>
 
-        <!-- Graph View Page -->
-        <section id="graphPage" class="page-section" ng-show="currentPage === 'graph'">
-            <div class="card">
-                <div class="card-header">
-                    <h2 class="card-title">🕸️ Network Graph</h2>
-                    <button class="btn btn-primary" ng-click="loadGraphData()">
-                        ↻ Refresh Graph
-                    </button>
-                    <button class="btn btn-secondary" ng-click="showGraphStats = !showGraphStats">
-                        📊 Toggle Stats
-                    </button>
+    <!-- ==================== PROFILE DIALOG ==================== -->
+    <div class="scrim" ng-class="{open: selectedBiodata}" ng-click="closeModals()">
+        <div class="dialog" ng-click="$event.stopPropagation()" role="dialog" aria-modal="true" aria-labelledby="viewTitle">
+            <div class="dialog-head">
+                <span class="avatar" ng-class="selectedBiodata.gender || 'unknown'">{{initials(selectedBiodata.name)}}</span>
+                <h2 id="viewTitle">{{selectedBiodata.name || 'Profile'}}</h2>
+                <button class="icon-btn state-layer" ng-click="closeModals()" aria-label="Close"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
+            </div>
+            <div class="dialog-body" ng-if="selectedBiodata">
+                <div class="meta-row">
+                    <span class="chip chip-status status-{{selectedBiodata.ocr_status}}">{{statusLabel(selectedBiodata.ocr_status)}}</span>
+                    <span class="chip" ng-if="selectedBiodata.ocr_confidence !== null"><span class="material-symbols-outlined" aria-hidden="true">auto_awesome</span>{{selectedBiodata.ocr_confidence * 100 | number:0}}% confidence</span>
+                    <span class="chip"><span class="material-symbols-outlined" aria-hidden="true">description</span>{{selectedBiodata.original_filename || 'Manual entry'}}</span>
                 </div>
-                <div class="card-body">
-                    <div id="network-container"
-                        style="height: 600px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: #f8f9fa;">
-                    </div>
-                    <div style="margin-top: 10px; text-align: center;">
-                        <span class="badge" style="background: #e3f2fd; color: #1976d2; margin-right: 10px;">👤
-                            Person</span>
-                        <span class="badge" style="background: #e8f5e9; color: #388e3c; margin-right: 10px;">🏙️
-                            City</span>
-                        <span class="badge" style="background: #fff3e0; color: #f57c00; margin-right: 10px;">🎓
-                            Education</span>
-                        <span class="badge" style="background: #f3e5f5; color: #7b1fa2;">💼 Occupation</span>
-                    </div>
+                <div ng-repeat="section in fieldSections">
+                    <h3 class="section-title">{{section}}</h3>
+                    <dl class="kv-grid">
+                        <div class="kv" ng-repeat="field in fields | filter:{section: section}:true">
+                            <dt>{{field.label}}</dt>
+                            <dd ng-class="{'is-empty': !hasValue(selectedBiodata[field.key])}">{{hasValue(selectedBiodata[field.key]) ? selectedBiodata[field.key] : '—'}}</dd>
+                        </div>
+                    </dl>
                 </div>
             </div>
-        </section>
-    </main>
-
-    <!-- View Biodata Modal -->
-    <div id="biodataModal" class="modal-overlay" ng-class="{active: showBiodataModal}"
-        ng-click="closeBiodataModal($event)">
-        <div class="modal" ng-click="$event.stopPropagation()">
-            <div class="modal-header">
-                <h3 class="modal-title">💍 Biodata Details</h3>
-                <button class="modal-close" ng-click="showBiodataModal = false">&times;</button>
-            </div>
-            <div class="modal-body" ng-if="selectedBiodata">
-                <div style="margin-bottom: 1rem;">
-                    <span class="badge badge-{{selectedBiodata.ocr_status}}">{{selectedBiodata.ocr_status}}</span>
-                    <span style="margin-left: 1rem;">Confidence: {{(selectedBiodata.ocr_confidence || 0) * 100 |
-                        number:0}}%</span>
-                </div>
-                <div class="form-row">
-                    <div class="validation-field" ng-repeat="field in allFields" ng-if="selectedBiodata[field.key]">
-                        <span class="validation-field-label">{{field.label}}</span>
-                        <span class="validation-field-value">{{selectedBiodata[field.key] || '-'}}</span>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <a ng-if="selectedBiodata.file_path" href="{{getFileUrl(selectedBiodata.file_path)}}" target="_blank"
-                    class="btn btn-primary" style="text-decoration: none; margin-right: auto;">
-                    📄 View PDF
+            <div class="dialog-actions">
+                <a ng-if="selectedBiodata.file_path" ng-href="{{fileUrl(selectedBiodata)}}" target="_blank" rel="noopener" class="btn btn-text state-layer">
+                    <span class="material-symbols-outlined" aria-hidden="true">open_in_new</span>Document
                 </a>
-                <button class="btn btn-secondary" ng-click="showBiodataModal = false">Close</button>
+                <span class="spacer"></span>
+                <button class="btn btn-outlined state-layer" ng-click="editBiodata(selectedBiodata)"><span class="material-symbols-outlined" aria-hidden="true">edit</span>Edit</button>
+                <button class="btn btn-filled state-layer" ng-if="selectedBiodata.is_approved" ng-click="findMatchesFor(selectedBiodata)"><span class="material-symbols-outlined" aria-hidden="true">favorite</span>Find matches</button>
             </div>
         </div>
     </div>
 
-    <!-- Edit Biodata Modal -->
-    <div id="editModal" class="modal-overlay" ng-class="{active: showEditModal}" ng-click="closeEditModal($event)">
-        <div class="modal" ng-click="$event.stopPropagation()">
-            <div class="modal-header">
-                <h3 class="modal-title">✏️ Edit Biodata</h3>
-                <button class="modal-close" ng-click="showEditModal = false">&times;</button>
+    <!-- ==================== EDIT DIALOG ==================== -->
+    <div class="scrim" ng-class="{open: editingBiodata}" ng-click="closeModals()">
+        <div class="dialog wide" ng-click="$event.stopPropagation()" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+            <div class="dialog-head">
+                <span class="material-symbols-outlined" aria-hidden="true" style="color: var(--md-sys-color-primary)">edit_note</span>
+                <h2 id="editTitle">Edit {{editingBiodata.name || 'profile'}}</h2>
+                <a ng-if="editingBiodata.file_path" ng-href="{{fileUrl(editingBiodata)}}" target="_blank" rel="noopener" class="btn btn-text state-layer">
+                    <span class="material-symbols-outlined" aria-hidden="true">open_in_new</span>Document
+                </a>
+                <button class="icon-btn state-layer" ng-click="closeModals()" aria-label="Close"><span class="material-symbols-outlined" aria-hidden="true">close</span></button>
             </div>
-            <div class="modal-body" ng-if="editingBiodata">
-                <form id="editForm">
-                    <div class="form-row">
-                        <div class="form-group" ng-repeat="field in editFields">
-                            <label class="form-label">{{field.label}}</label>
-                            <select ng-if="field.type === 'select'" class="form-select"
-                                ng-model="editingBiodata[field.key]">
-                                <option value="">Select...</option>
-                                <option ng-repeat="opt in field.options" value="{{opt}}">{{opt}}</option>
-                            </select>
-                            <input ng-if="field.type !== 'select'" type="{{field.type || 'text'}}" class="form-input"
-                                ng-model="editingBiodata[field.key]">
+            <div class="dialog-body" ng-if="editingBiodata">
+                <form name="editForm" ng-submit="saveEditAndApprove()" novalidate>
+                    <div ng-repeat="section in fieldSections">
+                        <h3 class="section-title">{{section}}</h3>
+                        <div class="form-grid">
+                            <div class="field" ng-repeat="field in fields | filter:{section: section}:true" ng-class="{'span-2': field.type === 'textarea'}">
+                                <label for="edit-{{field.key}}">{{field.label}}</label>
+                                <select ng-if="field.type === 'select'" id="edit-{{field.key}}" class="select" ng-model="editingBiodata[field.key]">
+                                    <option value="">—</option>
+                                    <option ng-repeat="opt in field.options" value="{{opt}}">{{opt}}</option>
+                                </select>
+                                <textarea ng-if="field.type === 'textarea'" id="edit-{{field.key}}" class="input" rows="2" ng-model="editingBiodata[field.key]"></textarea>
+                                <input ng-if="field.type !== 'select' && field.type !== 'textarea'" id="edit-{{field.key}}"
+                                    type="{{field.type || 'text'}}" class="input" ng-model="editingBiodata[field.key]"
+                                    ng-attr-min="{{field.type === 'number' ? 1 : undefined}}" ng-attr-max="{{field.type === 'number' ? 119 : undefined}}">
+                            </div>
                         </div>
                     </div>
                 </form>
             </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary" ng-click="showEditModal = false">Cancel</button>
-                <button class="btn btn-success" ng-click="saveEditAndApprove()">Save & Approve</button>
+            <div class="dialog-actions">
+                <button class="btn btn-text btn-danger state-layer" ng-click="deleteBiodata(editingBiodata)"><span class="material-symbols-outlined" aria-hidden="true">delete</span>Delete</button>
+                <span class="spacer"></span>
+                <button class="btn btn-text state-layer" ng-click="closeModals()">Cancel</button>
+                <button class="btn btn-filled state-layer" ng-click="saveEditAndApprove()" ng-disabled="busy[editingBiodata.id]">
+                    <span class="material-symbols-outlined" aria-hidden="true">check</span>Save &amp; approve
+                </button>
             </div>
         </div>
     </div>
 
-    <!-- Toast Container -->
-    <div id="toastContainer" class="toast-container">
-        <div class="toast toast-{{toast.type}}" ng-repeat="toast in toasts">
-            {{toast.message}}
+    <!-- ==================== SNACKBARS ==================== -->
+    <div class="snackbars" aria-live="polite">
+        <div class="snackbar" ng-class="toast.type" ng-repeat="toast in toasts">
+            <span class="material-symbols-outlined" aria-hidden="true">{{toast.type === 'error' ? 'error' : 'check_circle'}}</span>
+            <span>{{toast.message}}</span>
         </div>
     </div>
 
-    <!-- AngularJS Application -->
-    <script src="/static/js/app.js?v=2"></script>
+    <script src="/static/js/app.js?v=4"></script>
 </body>
 
 </html>

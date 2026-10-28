@@ -1,26 +1,28 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Install system dependencies (required for OpenCV)
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+COPY backend ./backend
+COPY frontend ./frontend
+COPY run.py .
 
-# Create storage directories
-RUN mkdir -p uploads storage
+# Run as an unprivileged user; uploads and the JSON database live in /app/data
+RUN useradd --create-home appuser \
+    && mkdir -p /app/data/uploads /app/data/db \
+    && chown -R appuser /app/data
+USER appuser
 
-# Expose port (Cloud Run sets PORT env var, we default to 8080)
+ENV UPLOAD_DIR=/app/data/uploads \
+    DB_DIR=/app/data/db
+VOLUME ["/app/data"]
+
+# Cloud Run sets PORT; default to 8080
 EXPOSE 8080
-
-# Command to run the application
-# We use shell form to ensure $PORT is expanded
+HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.getenv(\"PORT\",\"8080\")}/api/health')"
 CMD exec uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8080}

@@ -1,470 +1,426 @@
 """
 OCR Service - LLM-based OCR for biodata extraction.
-Follows Single Responsibility Principle.
+
+Providers only talk to the model and return raw text. Parsing, normalization
+and confidence scoring are shared, so every provider produces identical output.
+Errors are raised (not swallowed) so the queue can retry transient failures.
 """
+import asyncio
 import base64
 import json
-import os
+import logging
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, List, Optional
+
 import httpx
 
 from backend.config import settings
-from backend.models import BiodataBase, OCRStatus
+from backend.models import BiodataBase, Gender, MaritalStatus
+
+logger = logging.getLogger(__name__)
+
+MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+BIODATA_FIELDS = list(BiodataBase.model_fields)
+
+_GENDER_ALIASES = {
+    "m": Gender.MALE, "male": Gender.MALE, "boy": Gender.MALE, "groom": Gender.MALE, "man": Gender.MALE,
+    "f": Gender.FEMALE, "female": Gender.FEMALE, "girl": Gender.FEMALE, "bride": Gender.FEMALE,
+    "woman": Gender.FEMALE, "other": Gender.OTHER,
+}
+
+_MARITAL_ALIASES = {
+    "single": MaritalStatus.SINGLE, "unmarried": MaritalStatus.SINGLE,
+    "never married": MaritalStatus.SINGLE, "bachelor": MaritalStatus.SINGLE,
+    "married": MaritalStatus.MARRIED,
+    "divorced": MaritalStatus.DIVORCED, "divorcee": MaritalStatus.DIVORCED,
+    "widowed": MaritalStatus.WIDOWED, "widow": MaritalStatus.WIDOWED, "widower": MaritalStatus.WIDOWED,
+}
+
+_DOB_FORMATS = ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d %B %Y", "%d %b %Y", "%B %d, %Y")
+
+
+def build_extraction_prompt() -> str:
+    """Prompt asking the model for a JSON object with every biodata field."""
+    schema = ",\n".join(f'    "{field}": ...' for field in BIODATA_FIELDS)
+    return f"""You are an expert at extracting structured data from biodata/matrimonial profile documents.
+
+Analyze this biodata document and extract ALL available information into a single JSON object with exactly these keys:
+{{
+{schema}
+}}
+
+Rules:
+1. Return ONLY the JSON object, no markdown or commentary.
+2. Use null for fields not present in the document. Never invent values.
+3. Preserve values as written (names, education, addresses), translated to English where needed.
+4. "age" must be an integer. If missing but the date of birth is present, compute it as of {date.today().isoformat()}.
+5. "gender" must be "male", "female", "other" or null. Infer it from clear cues (e.g. "Son of" -> male).
+6. "marital_status" must be "single", "married", "divorced", "widowed" or null.
+7. Every other value must be a string or null."""
+
+
+@dataclass
+class OCRResult:
+    """Normalized OCR output."""
+    data: Dict[str, Any]
+    confidence: float
+    raw_text: str
+
+
+def parse_json_object(raw_text: str) -> Dict[str, Any]:
+    """
+    Extract the first JSON object from model output (tolerates code fences,
+    chatter, and trailing text that itself contains braces).
+    """
+    text = raw_text or ""
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    while start != -1:
+        try:
+            parsed, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        start = text.find("{", start + 1)
+    return {}
+
+
+def _age_from_dob(dob: str) -> Optional[int]:
+    for fmt in _DOB_FORMATS:
+        try:
+            born = datetime.strptime(dob.strip(), fmt).date()
+        except ValueError:
+            continue
+        today = date.today()
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    return None
+
+
+def _to_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        value = ", ".join(str(v) for v in value if v not in (None, ""))
+    elif isinstance(value, dict):
+        value = ", ".join(f"{k}: {v}" for k, v in value.items() if v not in (None, ""))
+    text = str(value).strip()
+    return text if text and text.lower() not in {"null", "none", "n/a", "na", "-"} else None
+
+
+def normalize_biodata_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Coerce raw LLM output into values that validate against BiodataBase.
+    Unknown keys are dropped; unrecognized enum values become None.
+    """
+    data: Dict[str, Any] = {}
+    for field in BIODATA_FIELDS:
+        value = raw.get(field)
+        if field == "age":
+            data[field] = _parse_age(value)
+        elif field == "gender":
+            text = _to_text(value)
+            data[field] = _GENDER_ALIASES.get(text.lower()) if text else None
+        elif field == "marital_status":
+            text = _to_text(value)
+            data[field] = _MARITAL_ALIASES.get(text.lower()) if text else None
+        else:
+            data[field] = _to_text(value)
+
+    if data["age"] is None and data["date_of_birth"]:
+        data["age"] = _age_from_dob(data["date_of_birth"])
+    return data
+
+
+def _parse_age(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        age = int(value)
+    else:
+        match = re.search(r"\d{1,3}", str(value))
+        if not match:
+            return None
+        age = int(match.group())
+    return age if 0 < age < 120 else None
+
+
+def compute_confidence(data: Dict[str, Any]) -> float:
+    """Share of schema fields that were filled in."""
+    filled = sum(1 for field in BIODATA_FIELDS if data.get(field) is not None)
+    return round(filled / len(BIODATA_FIELDS), 4)
+
+
+def _read_file(file_path: str) -> tuple[bytes, str]:
+    path = Path(file_path)
+    mime_type = MIME_TYPES.get(path.suffix.lower())
+    if not mime_type:
+        raise ValueError(f"Unsupported file type: {path.suffix}")
+    return path.read_bytes(), mime_type
 
 
 class OCRProviderInterface(ABC):
-    """Abstract interface for OCR providers."""
+    """A provider sends a document to a model and returns its raw text reply."""
+
+    name: str = "unknown"
 
     @abstractmethod
-    async def extract_biodata(self, file_path: str) -> Tuple[Dict[str, Any], float, str]:
-        """
-        Extract biodata from file using OCR.
-
-        Args:
-            file_path: Path to the PDF/image file
-
-        Returns:
-            Tuple of (extracted_data, confidence_score, raw_text)
-        """
-        pass
+    async def extract_text(self, file_path: str, model: Optional[str] = None) -> str:
+        """Return the model's raw (JSON) response for the document."""
 
 
 class AnthropicOCRProvider(OCRProviderInterface):
     """Anthropic Claude-based OCR provider."""
 
-    def __init__(self, api_key: Optional[str] = None):
+    name = "anthropic"
+    api_url = "https://api.anthropic.com/v1/messages"
+
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or settings.ANTHROPIC_API_KEY
-        self.api_url = "https://api.anthropic.com/v1/messages"
-        self.model = "claude-sonnet-4-20250514"
+        self.model = model or settings.ANTHROPIC_MODEL
 
-    def _get_extraction_prompt(self) -> str:
-        """Get the prompt for biodata extraction."""
-        return """You are an expert at extracting structured data from biodata/matrimonial profile documents.
-
-Analyze this biodata document and extract ALL available information into the following JSON structure.
-Be thorough and extract every piece of information visible in the document.
-
-Required JSON structure:
-{
-    "name": "Full name",
-    "age": number or null,
-    "gender": "male" or "female" or "other" or null,
-    "date_of_birth": "date string" or null,
-    "height": "height string" or null,
-    "weight": "weight string" or null,
-    "complexion": "complexion description" or null,
-    "blood_group": "blood group" or null,
-    "education": "education details" or null,
-    "occupation": "occupation/job" or null,
-    "income": "income/salary" or null,
-    "company": "company name" or null,
-    "father_name": "father's name" or null,
-    "father_occupation": "father's occupation" or null,
-    "mother_name": "mother's name" or null,
-    "mother_occupation": "mother's occupation" or null,
-    "siblings": "siblings info" or null,
-    "native_place": "native place" or null,
-    "current_city": "current city" or null,
-    "state": "state" or null,
-    "country": "country" or null,
-    "religion": "religion" or null,
-    "caste": "caste" or null,
-    "subcaste": "subcaste" or null,
-    "gotra": "gotra" or null,
-    "rashi": "rashi/zodiac" or null,
-    "nakshatra": "nakshatra/star" or null,
-    "manglik": "manglik status" or null,
-    "contact_number": "phone number" or null,
-    "email": "email address" or null,
-    "marital_status": "single" or "married" or "divorced" or "widowed" or null,
-    "partner_preferences": "partner preference details" or null,
-    "hobbies": "hobbies/interests" or null,
-    "about": "about/description" or null
-}
-
-IMPORTANT:
-1. Return ONLY the JSON object, no additional text
-2. Use null for fields not found in the document
-3. Preserve exact values as written in the document
-4. For 'age': If explicit age is missing but Date of Birth is present, CALCULATE the age based on current year (2025).
-5. For 'gender': If not explicitly stated, INFER it from the name, photos, or family details (e.g., "Son of" -> Male).
-6. Extract ALL text content you can read from the document"""
-
-    async def _encode_file(self, file_path: str) -> Tuple[str, str]:
-        """Encode file to base64 for API."""
-        path = Path(file_path)
-        suffix = path.suffix.lower()
-
-        with open(file_path, "rb") as f:
-            content = f.read()
-
-        encoded = base64.standard_b64encode(content).decode("utf-8")
-
-        # Determine media type
-        if suffix == ".pdf":
-            media_type = "application/pdf"
-        elif suffix in [".png"]:
-            media_type = "image/png"
-        elif suffix in [".jpg", ".jpeg"]:
-            media_type = "image/jpeg"
-        else:
-            media_type = "application/octet-stream"
-
-        return encoded, media_type
-
-    async def extract_biodata(self, file_path: str) -> Tuple[Dict[str, Any], float, str]:
-        """
-        Extract biodata using Claude Vision.
-
-        Args:
-            file_path: Path to the file
-
-        Returns:
-            Tuple of (extracted_data, confidence_score, raw_text)
-        """
+    async def extract_text(self, file_path: str, model: Optional[str] = None) -> str:
         if not self.api_key:
             raise ValueError("Anthropic API key not configured")
 
-        encoded_content, media_type = await self._encode_file(file_path)
-
-        # Build the message with image/document
-        if media_type == "application/pdf":
-            content = [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": encoded_content,
+        content, media_type = _read_file(file_path)
+        block_type = "document" if media_type == "application/pdf" else "image"
+        payload = {
+            "model": model or self.model,
+            "max_tokens": 4096,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": block_type,
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": base64.standard_b64encode(content).decode("ascii"),
+                        },
                     },
-                },
-                {"type": "text", "text": self._get_extraction_prompt()},
-            ]
-        else:
-            content = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": encoded_content,
-                    },
-                },
-                {"type": "text", "text": self._get_extraction_prompt()},
-            ]
-
+                    {"type": "text", "text": build_extraction_prompt()},
+                ],
+            }],
+        }
         headers = {
-            "Content-Type": "application/json",
+            "content-type": "application/json",
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
         }
-
-        payload = {
-            "model": self.model,
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": content}],
-        }
-
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(self.api_url, headers=headers, json=payload)
             response.raise_for_status()
             result = response.json()
 
-        # Extract the text response
-        raw_text = result["content"][0]["text"]
-
-        # Parse JSON from response
-        try:
-            # Try to find JSON in the response
-            json_match = re.search(r"\{[\s\S]*\}", raw_text)
-            if json_match:
-                extracted_data = json.loads(json_match.group())
-            else:
-                extracted_data = {}
-        except json.JSONDecodeError:
-            extracted_data = {}
-
-        # Calculate confidence based on filled fields
-        total_fields = len(BiodataBase.model_fields)
-        filled_fields = sum(1 for v in extracted_data.values() if v is not None)
-        confidence = filled_fields / total_fields if total_fields > 0 else 0.0
-
-        return extracted_data, confidence, raw_text
+        return "".join(block.get("text", "") for block in result.get("content", []) if block.get("type") == "text")
 
 
 class VertexAIOCRProvider(OCRProviderInterface):
-    """Google Vertex AI Gemini-based OCR provider."""
+    """Google Gemini on Vertex AI, via the google-genai SDK."""
 
-    def __init__(self, project_id: Optional[str] = None, location: str = "us-central1", model: str = "gemini-2.0-flash-001"):
+    name = "vertexai"
+
+    def __init__(self, project_id: Optional[str] = None, location: Optional[str] = None, model: Optional[str] = None):
         self.project_id = project_id or settings.GCP_PROJECT_ID
         self.location = location or settings.GCP_LOCATION
-        self.model = model
-        self._initialized = False
+        self.model = model or settings.VERTEX_MODEL
+        self._client = None
 
-    def _initialize(self):
-        """Initialize Vertex AI SDK."""
-        if not self._initialized:
-            try:
-                import vertexai
-                from vertexai.generative_models import GenerativeModel
-                
-                if self.project_id:
-                    vertexai.init(project=self.project_id, location=self.location)
-                else:
-                    # Use default credentials
-                    vertexai.init(location=self.location)
-                self._initialized = True
-            except Exception as e:
-                raise ValueError(f"Failed to initialize Vertex AI: {e}")
+    def _get_client(self):
+        if self._client is None:
+            from google import genai
+            self._client = genai.Client(vertexai=True, project=self.project_id, location=self.location)
+        return self._client
 
-    def _get_extraction_prompt(self) -> str:
-        """Get the prompt for biodata extraction."""
-        return """You are an expert at extracting structured data from biodata/matrimonial profile documents.
+    async def extract_text(self, file_path: str, model: Optional[str] = None) -> str:
+        from google.genai import types
 
-Analyze this biodata document and extract ALL available information into the following JSON structure.
-Be thorough and extract every piece of information visible in the document.
-
-Required JSON structure:
-{
-    "name": "Full name",
-    "age": number or null,
-    "gender": "male" or "female" or "other" or null,
-    "date_of_birth": "date string" or null,
-    "height": "height string" or null,
-    "weight": "weight string" or null,
-    "complexion": "complexion description" or null,
-    "blood_group": "blood group" or null,
-    "education": "education details" or null,
-    "occupation": "occupation/job" or null,
-    "income": "income/salary" or null,
-    "company": "company name" or null,
-    "father_name": "father's name" or null,
-    "father_occupation": "father's occupation" or null,
-    "mother_name": "mother's name" or null,
-    "mother_occupation": "mother's occupation" or null,
-    "siblings": "siblings info" or null,
-    "native_place": "native place" or null,
-    "current_city": "current city" or null,
-    "state": "state" or null,
-    "country": "country" or null,
-    "religion": "religion" or null,
-    "caste": "caste" or null,
-    "subcaste": "subcaste" or null,
-    "gotra": "gotra" or null,
-    "rashi": "rashi/zodiac" or null,
-    "nakshatra": "nakshatra/star" or null,
-    "manglik": "manglik status" or null,
-    "contact_number": "phone number" or null,
-    "email": "email address" or null,
-    "marital_status": "single" or "married" or "divorced" or "widowed" or null,
-    "partner_preferences": "partner preference details" or null,
-    "hobbies": "hobbies/interests" or null,
-    "about": "about/description" or null
-}
-
-IMPORTANT:
-1. Return ONLY the JSON object, no additional text
-2. Use null for fields not found in the document
-3. Preserve exact values as written in the document
-4. For 'age': If explicit age is missing but Date of Birth is present, CALCULATE the age based on current year (2025).
-5. For 'gender': If not explicitly stated, INFER it from the name, photos, or family details (e.g., "Son of" -> Male).
-6. Extract ALL text content you can read from the document"""
-
-    async def _load_file_as_part(self, file_path: str):
-        """Load file as Vertex AI Part."""
-        from vertexai.generative_models import Part
-        
-        path = Path(file_path)
-        suffix = path.suffix.lower()
-
-        with open(file_path, "rb") as f:
-            content = f.read()
-
-        # Determine mime type
-        if suffix == ".pdf":
-            mime_type = "application/pdf"
-        elif suffix == ".png":
-            mime_type = "image/png"
-        elif suffix in [".jpg", ".jpeg"]:
-            mime_type = "image/jpeg"
-        else:
-            mime_type = "application/octet-stream"
-
-        return Part.from_data(content, mime_type=mime_type)
-
-    async def extract_biodata(self, file_path: str) -> Tuple[Dict[str, Any], float, str]:
-        """
-        Extract biodata using Vertex AI Gemini.
-
-        Args:
-            file_path: Path to the file
-
-        Returns:
-            Tuple of (extracted_data, confidence_score, raw_text)
-        """
-        self._initialize()
-        
-        from vertexai.generative_models import GenerativeModel
-
-        # Load model
-        model = GenerativeModel(self.model)
-
-        # Create content with file
-        file_part = await self._load_file_as_part(file_path)
-        
-        # Generate response
-        response = await model.generate_content_async(
-            [file_part, self._get_extraction_prompt()],
-            generation_config={
-                "max_output_tokens": 4096,
-                "temperature": 0.1,
-            }
+        content, mime_type = _read_file(file_path)
+        response = await self._get_client().aio.models.generate_content(
+            model=model or self.model,
+            contents=[types.Part.from_bytes(data=content, mime_type=mime_type), build_extraction_prompt()],
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=4096,
+                response_mime_type="application/json",
+            ),
         )
+        return response.text or ""
 
-        # Extract the text response
-        raw_text = response.text
 
-        # Parse JSON from response
-        try:
-            # Try to find JSON in the response
-            json_match = re.search(r"\{[\s\S]*\}", raw_text)
-            if json_match:
-                extracted_data = json.loads(json_match.group())
-            else:
-                extracted_data = {}
-        except json.JSONDecodeError:
-            extracted_data = {}
+class NvidiaOCRProvider(OCRProviderInterface):
+    """
+    NVIDIA NIM (OpenAI-compatible API) as a two-stage pipeline:
 
-        # Calculate confidence based on filled fields
-        total_fields = len(BiodataBase.model_fields)
-        filled_fields = sum(1 for v in extracted_data.values() if v is not None)
-        confidence = filled_fields / total_fields if total_fields > 0 else 0.0
+    1. Read: a vision model transcribes each page image to text. PDFs that
+       already carry a text layer skip this step entirely.
+    2. Extract: a text model (Nemotron Ultra by default) turns the transcript
+       into the biodata JSON.
 
-        return extracted_data, confidence, raw_text
+    Two stages are needed because the Nemotron text models do not accept images.
+    """
+
+    name = "nvidia"
+    # A PDF page with at least this many characters of embedded text is used as-is
+    MIN_TEXT_LAYER_CHARS = 80
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        vision_model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ):
+        self.api_key = api_key or settings.NVIDIA_API_KEY
+        self.model = model or settings.NVIDIA_MODEL
+        self.vision_model = vision_model or settings.NVIDIA_VISION_MODEL
+        self.base_url = (base_url or settings.NVIDIA_BASE_URL).rstrip("/")
+        self._transport = transport  # injectable for tests
+
+    async def _chat(self, client: httpx.AsyncClient, model: str, content: Any, max_tokens: int) -> str:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.1,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": settings.NVIDIA_ENABLE_THINKING},
+        }
+        response = await client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json=payload,
+        )
+        response.raise_for_status()
+        message = response.json()["choices"][0]["message"]
+        return message.get("content") or ""
+
+    def _document_pages(self, file_path: str) -> tuple[List[str], List[bytes]]:
+        """
+        Split a document into (embedded text per page, PNG images of pages needing OCR).
+        Images are returned as-is; PDF pages without a usable text layer are rendered.
+        """
+        content, mime_type = _read_file(file_path)
+        if mime_type != "application/pdf":
+            return [], [content]
+
+        import fitz  # PyMuPDF
+
+        texts, images = [], []
+        with fitz.open(stream=content, filetype="pdf") as doc:
+            for page in list(doc)[: settings.NVIDIA_MAX_PDF_PAGES]:
+                text = page.get_text().strip()
+                if len(text) >= self.MIN_TEXT_LAYER_CHARS:
+                    texts.append(text)
+                else:
+                    images.append(page.get_pixmap(dpi=150).tobytes("png"))
+        return texts, images
+
+    async def _transcribe(self, client: httpx.AsyncClient, image: bytes) -> str:
+        mime = "image/jpeg" if image.startswith(b"\xff\xd8\xff") else "image/png"
+        data_url = f"data:{mime};base64,{base64.b64encode(image).decode('ascii')}"
+        return await self._chat(client, self.vision_model, [
+            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": (
+                "Transcribe all text in this biodata document exactly, line by line, "
+                "keeping labels next to their values. Translate non-English text to English. "
+                "Output only the text."
+            )},
+        ], max_tokens=4096)
+
+    async def extract_text(self, file_path: str, model: Optional[str] = None) -> str:
+        if not self.api_key:
+            raise ValueError("NVIDIA API key not configured (set NVIDIA_API_KEY)")
+
+        texts, images = await asyncio.to_thread(self._document_pages, file_path)
+        async with httpx.AsyncClient(timeout=300.0, transport=self._transport) as client:
+            for image in images:
+                texts.append(await self._transcribe(client, image))
+            transcript = "\n\n".join(t for t in texts if t.strip())
+            if not transcript:
+                raise ValueError("No text could be read from the document")
+
+            prompt = f"{build_extraction_prompt()}\n\nDocument text:\n{transcript}"
+            answer = await self._chat(client, model or self.model, prompt, max_tokens=4096)
+
+        # Keep the transcript with the JSON so reviewers can see what the model read
+        return f"{answer.strip()}\n\n--- Transcript ---\n{transcript}"
 
 
 class MockOCRProvider(OCRProviderInterface):
-    """Mock OCR provider - returns empty data when no LLM is configured."""
+    """No-op provider used when no LLM is configured. Extracts nothing."""
 
-    async def extract_biodata(self, file_path: str) -> Tuple[Dict[str, Any], float, str]:
-        """Return empty data - configure LLM_PROVIDER in .env for real OCR."""
-        import asyncio
-        await asyncio.sleep(0.5) # Simulate latency
-            
-        # Return empty dict - no hardcoded values
-        # User must configure vertexai or anthropic in .env for actual OCR
-        return {}, 0.9, "Mock OCR Response"
+    name = "local"
+
+    async def extract_text(self, file_path: str, model: Optional[str] = None) -> str:
+        return "{}"
+
+
+def get_default_provider() -> OCRProviderInterface:
+    """Pick the OCR provider from configuration."""
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "vertexai":
+        return VertexAIOCRProvider()
+    if provider == "nvidia":
+        if settings.NVIDIA_API_KEY:
+            return NvidiaOCRProvider()
+        logger.warning("LLM_PROVIDER=nvidia but NVIDIA_API_KEY is not set; using mock OCR")
+    elif provider == "anthropic":
+        if settings.ANTHROPIC_API_KEY:
+            return AnthropicOCRProvider()
+        logger.warning("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set; using mock OCR")
+    elif provider != "local":
+        logger.warning("Unknown LLM_PROVIDER %r; using mock OCR", settings.LLM_PROVIDER)
+    return MockOCRProvider()
 
 
 class OCRService:
-    """
-    Main OCR service that coordinates extraction.
-    Follows Open/Closed Principle - easy to add new providers.
-    """
+    """Coordinates extraction: provider call -> JSON parsing -> normalization -> confidence."""
 
-    def __init__(self, provider: Optional[OCRProviderInterface] = None, model: Optional[str] = None):
-        self.model = model
-        self.provider = provider or self._get_default_provider()
+    def __init__(self, provider: Optional[OCRProviderInterface] = None):
+        self.provider = provider or get_default_provider()
 
-    def _get_default_provider(self) -> OCRProviderInterface:
-        """Get the default OCR provider based on configuration."""
-        llm_provider = settings.LLM_PROVIDER.lower()
-        
-        if llm_provider == "vertexai":
-            project_id = settings.GCP_PROJECT_ID
-            location = settings.GCP_LOCATION
-            model = self.model or settings.VERTEX_MODEL
-            return VertexAIOCRProvider(project_id=project_id, location=location, model=model)
-        elif llm_provider == "anthropic":
-            api_key = settings.ANTHROPIC_API_KEY
-            if api_key:
-                return AnthropicOCRProvider(api_key)
-        
-        # Fall back to mock for development
-        return MockOCRProvider()
+    @property
+    def provider_name(self) -> str:
+        return self.provider.name
 
-    def set_model(self, model: str):
-        """Switch to a different model."""
-        self.model = model
+    def available_models(self) -> List[str]:
+        """Models the user may pick from."""
         if isinstance(self.provider, VertexAIOCRProvider):
-            self.provider.model = model
+            return list(settings.AVAILABLE_MODELS)
+        if isinstance(self.provider, NvidiaOCRProvider):
+            return list(dict.fromkeys([self.provider.model, *settings.NVIDIA_AVAILABLE_MODELS]))
+        if isinstance(self.provider, AnthropicOCRProvider):
+            return [self.provider.model]
+        return []
 
-    async def process_file(self, file_path: str, model: Optional[str] = None) -> Tuple[Dict[str, Any], float, str, OCRStatus]:
-        """
-        Process a file and extract biodata.
+    def default_model(self) -> Optional[str]:
+        return getattr(self.provider, "model", None)
 
-        Args:
-            file_path: Path to the uploaded file
-            model: Optional model override for this request
+    def validate_model(self, model: Optional[str]) -> Optional[str]:
+        """Return the model if allowed, else raise ValueError."""
+        if model and model not in self.available_models():
+            raise ValueError(f"Unsupported model: {model}")
+        return model
 
-        Returns:
-            Tuple of (extracted_data, confidence, raw_text, status)
-        """
-        try:
-            # Temporarily set model if provided
-            original_model = None
-            if model and isinstance(self.provider, VertexAIOCRProvider):
-                original_model = self.provider.model
-                self.provider.model = model
-
-            extracted_data, confidence, raw_text = await self.provider.extract_biodata(
-                file_path
-            )
-
-            # Restore original model
-            if original_model and isinstance(self.provider, VertexAIOCRProvider):
-                self.provider.model = original_model
-
-            # Post-processing: Calculate Age if missing
-            try:
-                if not extracted_data.get('age') and extracted_data.get('date_of_birth'):
-                    from datetime import datetime
-                    dob_str = str(extracted_data['date_of_birth'])
-                    # Try common formats
-                    for fmt in ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d.%m.%Y', '%B %d, %Y']:
-                        try:
-                            dob = datetime.strptime(dob_str, fmt)
-                            today = datetime.now()
-                            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                            extracted_data['age'] = age
-                            break
-                        except ValueError:
-                            continue
-            except Exception as e:
-                # Ignore calculation errors
-                print(f"Error calculating age: {e}")
-
-            # Determine status based on confidence
-            if confidence >= 0.7:
-                status = OCRStatus.COMPLETED
-            elif confidence >= 0.3:
-                status = OCRStatus.COMPLETED  # Still completed, but needs review
-            else:
-                status = OCRStatus.COMPLETED  # Completed with low confidence
-
-            return extracted_data, confidence, raw_text, status
-
-        except Exception as e:
-            return {}, 0.0, str(e), OCRStatus.FAILED
-
-    async def reprocess_file(self, file_path: str, model: Optional[str] = None) -> Tuple[Dict[str, Any], float, str, OCRStatus]:
-        """Re-run OCR on a file."""
-        return await self.process_file(file_path, model=model)
-    
-    @staticmethod
-    def get_available_models() -> list:
-        """Get list of available Gemini models."""
-        return [
-            "gemini-2.0-flash-001",
-            "gemini-2.0-flash-lite-001",
-            "gemini-2.5-pro-preview-06-05",
-            "gemini-2.5-flash-preview-05-20",
-        ]
+    async def process_file(self, file_path: str, model: Optional[str] = None) -> OCRResult:
+        """Run OCR on a file. Raises on provider errors."""
+        raw_text = await self.provider.extract_text(file_path, model=model)
+        data = normalize_biodata_fields(parse_json_object(raw_text))
+        return OCRResult(data=data, confidence=compute_confidence(data), raw_text=raw_text)
 
 
 # Singleton instance
 ocr_service = OCRService()
-

@@ -1,252 +1,133 @@
 """
 Biodata Router - CRUD operations for biodata.
 """
+import logging
+import math
+import mimetypes
 from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from backend.models import (
-    BiodataResponse,
-    BiodataListResponse,
     BiodataCreate,
-    BiodataUpdate,
     BiodataInDB,
+    BiodataListResponse,
+    BiodataResponse,
+    BiodataUpdate,
     OCRStatus,
 )
-from backend.services import db, storage_service, graph_service, similarity_service
-import logging
+from backend.services import db, graph_service, storage_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/biodata", tags=["biodata"])
 
 
-@router.get("", response_model=BiodataListResponse)
-async def list_biodatas(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
-    status: Optional[str] = Query(None, description="Filter by OCR status")
-):
-    """
-    List all biodatas with pagination.
-
-    Args:
-        page: Page number (1-indexed)
-        page_size: Items per page (max 100)
-        status: Optional OCR status filter
-    """
-    status_filter = None
-    if status:
-        try:
-            status_filter = OCRStatus(status)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-
-    biodatas, total = await db.get_all(
-        page=page,
-        page_size=page_size,
-        status_filter=status_filter
-    )
-
-    return BiodataListResponse(
-        total=total,
-        items=biodatas,
-        page=page,
-        page_size=page_size
-    )
-
-
-@router.get("/pending")
-async def get_pending_validation():
-    """Get biodatas pending OCR validation."""
-    pending = await db.get_pending_validation()
-    return {
-        "total": len(pending),
-        "items": pending
-    }
-
-
-@router.get("/approved")
-async def get_approved_biodatas():
-    """Get all approved biodatas."""
-    approved = await db.get_approved_biodatas()
-    return {
-        "total": len(approved),
-        "items": approved
-    }
-
-
-@router.get("/{biodata_id}", response_model=BiodataResponse)
-async def get_biodata(biodata_id: str):
-    """Get a specific biodata by ID."""
+async def get_or_404(biodata_id: str) -> BiodataInDB:
     biodata = await db.get_by_id(biodata_id)
     if not biodata:
         raise HTTPException(status_code=404, detail="Biodata not found")
     return biodata
 
 
-@router.post("", response_model=BiodataResponse)
-async def create_biodata(biodata: BiodataCreate):
-    """
-    Create a new biodata manually (without file upload).
-    """
-    new_biodata = BiodataInDB(
-        **biodata.model_dump(),
-        ocr_status=OCRStatus.APPROVED,  # Manual entries are pre-approved
-        is_approved=True,
+@router.get("", response_model=BiodataListResponse)
+async def list_biodatas(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    status: Optional[OCRStatus] = Query(None, description="Filter by OCR status"),
+    q: Optional[str] = Query(None, max_length=100, description="Text search over name, education, city, ..."),
+):
+    """List biodatas, newest first, with pagination and optional filters."""
+    items, total = await db.get_all(page=page, page_size=page_size, status_filter=status, query=q)
+    return BiodataListResponse(
+        total=total,
+        items=items,
+        page=page,
+        page_size=page_size,
+        pages=max(1, math.ceil(total / page_size)),
     )
-    saved = await db.create(new_biodata)
 
-    # Index for similarity search
-    await similarity_service.index_biodata(saved)
 
-    # Sync with Neo4j graph
-    try:
-        await graph_service.add_biodata(saved)
-    except Exception as e:
-        logger.warning(f"Failed to sync biodata to Neo4j: {e}")
+@router.get("/stats")
+async def get_biodata_stats():
+    """Record counts by OCR status."""
+    return await db.status_counts()
 
+
+@router.get("/pending")
+async def get_pending_validation():
+    """Biodatas awaiting review."""
+    pending = await db.get_pending_validation()
+    return {"total": len(pending), "items": pending}
+
+
+@router.get("/approved")
+async def get_approved_biodatas():
+    """All approved biodatas."""
+    approved = await db.get_approved_biodatas()
+    return {"total": len(approved), "items": approved}
+
+
+@router.get("/{biodata_id}", response_model=BiodataResponse)
+async def get_biodata(biodata_id: str):
+    """Get a specific biodata by ID."""
+    return await get_or_404(biodata_id)
+
+
+@router.post("", response_model=BiodataResponse, status_code=201)
+async def create_biodata(biodata: BiodataCreate):
+    """Create a biodata manually (no file). Manual entries are pre-approved."""
+    saved = await db.create(BiodataInDB(**biodata.model_dump(), ocr_status=OCRStatus.APPROVED, is_approved=True))
+    await graph_service.sync(saved)
     return saved
 
 
 @router.put("/{biodata_id}", response_model=BiodataResponse)
 async def update_biodata(biodata_id: str, update: BiodataUpdate):
-    """Update an existing biodata."""
-    existing = await db.get_by_id(biodata_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Biodata not found")
-
-    update_data = update.model_dump(exclude_unset=True)
-    updated = await db.update(biodata_id, update_data)
-
-    if updated:
-        # Re-index for similarity search
-        await similarity_service.index_biodata(updated)
-
-        # Sync with Neo4j graph
-        try:
-            await graph_service.add_biodata(updated)
-        except Exception as e:
-            logger.warning(f"Failed to sync biodata to Neo4j: {e}")
-
+    """Update fields of a biodata. Fields sent as null are cleared."""
+    await get_or_404(biodata_id)
+    updated = await db.update(biodata_id, update.model_dump(exclude_unset=True))
+    await graph_service.sync(updated)
     return updated
 
 
 @router.delete("/{biodata_id}")
 async def delete_biodata(biodata_id: str):
     """Delete a biodata and its associated file."""
-    existing = await db.get_by_id(biodata_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Biodata not found")
-
-    # Delete file if exists
+    existing = await get_or_404(biodata_id)
     if existing.file_path:
         await storage_service.delete_file(existing.file_path)
-
-    # Remove from similarity index
-    await similarity_service.remove_from_index(biodata_id)
-
-    # Delete from database
-    deleted = await db.delete(biodata_id)
-    if not deleted:
-        raise HTTPException(status_code=500, detail="Failed to delete biodata")
-
-    # Remove from Neo4j graph
-    try:
-        await graph_service.remove_biodata(biodata_id)
-    except Exception as e:
-        logger.warning(f"Failed to remove biodata from Neo4j: {e}")
-
+    await db.delete(biodata_id)
+    await graph_service.remove_biodata(biodata_id)
     return {"message": "Biodata deleted successfully", "id": biodata_id}
 
 
 @router.get("/{biodata_id}/file")
-async def get_biodata_file(biodata_id: str):
-    """Download the original file for a biodata."""
-    biodata = await db.get_by_id(biodata_id)
-    if not biodata:
-        raise HTTPException(status_code=404, detail="Biodata not found")
+async def get_biodata_file(biodata_id: str, download: bool = False):
+    """Serve the original document (inline by default, `?download=true` to save)."""
+    biodata = await get_or_404(biodata_id)
+    if not biodata.file_path or not await storage_service.file_exists(biodata.file_path):
+        raise HTTPException(status_code=404, detail="Original file not available")
 
-    if not biodata.file_path:
-        raise HTTPException(status_code=404, detail="No file associated with this biodata")
-
-    if not await storage_service.file_exists(biodata.file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
+    path = storage_service.resolve_path(biodata.file_path)
+    filename = biodata.original_filename or path.name
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(
-        biodata.file_path,
-        filename=biodata.original_filename or "biodata_file",
-        media_type="application/octet-stream"
+        path,
+        media_type=media_type,
+        filename=filename,
+        content_disposition_type="attachment" if download else "inline",
     )
 
 
 @router.get("/{biodata_id}/ocr-text")
 async def get_ocr_text(biodata_id: str):
-    """Get the raw OCR text for a biodata."""
-    biodata = await db.get_by_id(biodata_id)
-    if not biodata:
-        raise HTTPException(status_code=404, detail="Biodata not found")
-
+    """Raw OCR model output for a biodata."""
+    biodata = await get_or_404(biodata_id)
     return {
         "id": biodata_id,
         "raw_ocr_text": biodata.raw_ocr_text,
         "ocr_confidence": biodata.ocr_confidence,
-        "ocr_status": biodata.ocr_status
+        "ocr_status": biodata.ocr_status,
     }
-
-
-@router.post("/sync/neo4j")
-async def sync_all_to_neo4j():
-    """
-    Sync all existing biodatas to Neo4j graph database.
-    Use this to populate Neo4j with data uploaded before graph integration.
-    """
-    # Initialize schema
-    await graph_service.initialize_schema()
-
-    # Get all biodatas
-    biodatas, total = await db.get_all(page=1, page_size=1000)
-
-    synced = 0
-    failed = 0
-    errors = []
-
-    for biodata in biodatas:
-        try:
-            success = await graph_service.add_biodata(biodata)
-            if success:
-                synced += 1
-            else:
-                failed += 1
-                errors.append({"id": biodata.id, "error": "add_biodata returned False"})
-        except Exception as e:
-            failed += 1
-            errors.append({"id": biodata.id, "error": str(e)[:100]})
-
-    return {
-        "total": total,
-        "synced": synced,
-        "failed": failed,
-        "errors": errors[:10],  # First 10 errors
-        "message": f"Synced {synced}/{total} biodatas to Neo4j"
-    }
-
-
-@router.get("/graph/stats")
-async def get_graph_stats():
-    """Get Neo4j graph database statistics."""
-    stats = await graph_service.get_stats()
-    return stats
-
-
-@router.get("/graph/data")
-async def get_graph_data(
-    biodata_id: Optional[str] = Query(None, description="Center graph on specific biodata"),
-    limit: int = Query(50, ge=1, le=200, description="Max nodes to return")
-):
-    """
-    Get graph data for visualization.
-    Returns nodes and edges in D3.js compatible format.
-    """
-    data = await graph_service.get_graph_data(biodata_id=biodata_id, limit=limit)
-    return data
