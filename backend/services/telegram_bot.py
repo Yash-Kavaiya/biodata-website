@@ -104,7 +104,8 @@ class TelegramBot:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Telegram polling error: {e}")
+                # Network timeouts have an empty str(), so always include the type
+                logger.error(f"Telegram polling error ({type(e).__name__}): {e}")
                 await asyncio.sleep(5)
 
     async def close(self):
