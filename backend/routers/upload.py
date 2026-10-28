@@ -1,207 +1,164 @@
 """
-Upload Router - Handles file uploads (single and bulk) with optimized queue processing.
-Supports 100+ concurrent uploads with proper rate limiting and failure isolation.
+Upload Router - single and bulk uploads with rate-limited, retried OCR.
+A record is only created when OCR succeeds; failed files are deleted.
 """
 import asyncio
 import logging
-from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Query
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-from backend.models import (
-    UploadResponse,
-    BulkUploadResponse,
-    BiodataInDB,
-    OCRStatus,
-)
-from backend.services import storage_service, db, ocr_service, similarity_service, queue_service, graph_service
-from backend.services.ocr_service import OCRService
-from backend.services.queue_service import BatchJob, BatchStatus
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile
+
 from backend.config import settings
+from backend.models import BiodataInDB, BulkUploadResponse, OCRStatus, UploadResponse
+from backend.services import db, ocr_service, queue_service, storage_service
+from backend.services.queue_service import BatchJob
+from backend.services.storage_service import content_matches_extension
 
 router = APIRouter(prefix="/api/upload", tags=["upload"])
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class FileData:
-    """Holds file content and metadata for processing."""
-    content: bytes
-    filename: str
-    extension: str
+MAX_SYNC_BULK_FILES = 50
 
 
-# ==================== Helper Functions ====================
+# ==================== Helpers ====================
 
-def validate_file_extension(filename: str) -> tuple:
-    """
-    Validate file extension.
-    Returns: (is_valid, extension, error_message)
-    """
-    ext = "." + filename.split(".")[-1].lower() if "." in filename else ""
+def validate_upload_content(filename: str, content: bytes) -> str:
+    """Check extension, size and file signature; return the extension. Raises ValueError."""
+    ext = Path(filename or "").suffix.lower()
     if ext not in settings.ALLOWED_EXTENSIONS:
-        return False, ext, f"Invalid file type. Allowed: {settings.ALLOWED_EXTENSIONS}"
-    return True, ext, ""
+        raise ValueError(f"Invalid file type. Allowed: {', '.join(settings.ALLOWED_EXTENSIONS)}")
+    if len(content) > settings.max_file_bytes:
+        raise ValueError(f"File too large. Max size: {settings.MAX_FILE_SIZE_MB}MB")
+    if not content_matches_extension(content, ext):
+        raise ValueError(f"File content does not look like a valid {ext[1:].upper()}")
+    return ext
 
 
-def validate_file_size(content: bytes) -> tuple:
+async def read_valid_upload(file: UploadFile) -> Tuple[bytes, str]:
+    """Read an upload (bounded by the size limit) and validate it. Raises ValueError."""
+    content = await file.read(settings.max_file_bytes + 1)
+    return content, validate_upload_content(file.filename or "", content)
+
+
+def checked_model(model: Optional[str]) -> Optional[str]:
+    try:
+        return ocr_service.validate_model(model)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def failed(filename: str, message: str) -> UploadResponse:
+    return UploadResponse(id="", filename=filename, status=OCRStatus.FAILED, message=message)
+
+
+async def ingest_file(file_path: str, filename: str, model: Optional[str] = None) -> UploadResponse:
     """
-    Validate file size.
-    Returns: (is_valid, error_message)
-    """
-    if len(content) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-        return False, f"File too large. Max size: {settings.MAX_FILE_SIZE_MB}MB"
-    return True, ""
-
-
-async def process_file_atomic(
-    file_path: str,
-    filename: str,
-    model: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Process a single file atomically:
-    1. Run OCR (rate limited with retry)
-    2. If success: save to DB, return result
-    3. If fail: delete file, return error (NO DB record created)
-
-    Returns dict with id, filename, status, message
+    OCR a stored file (rate limited, with retries) and create its record.
+    On failure the file is deleted and no record is created.
     """
     try:
-        # OCR call (rate limiting handled by queue_service.process_with_limit)
-        extracted_data, confidence, raw_text, status = await queue_service.process_with_limit(
-            ocr_service.process_file,
-            file_path,
-            model=model
-        )
-
-        if status == OCRStatus.FAILED:
-            # Cleanup file - no DB record
-            await storage_service.delete_file(file_path)
-            return {
-                "id": "",
-                "filename": filename,
-                "status": OCRStatus.FAILED.value,
-                "message": f"OCR Failed: {raw_text[:100]}" if raw_text else "OCR Failed"
-            }
-
-        # Create DB record only on success
+        result = await queue_service.process_with_limit(ocr_service.process_file, file_path, model=model)
         biodata = BiodataInDB(
+            **result.data,
             file_path=file_path,
             original_filename=filename,
-            ocr_status=status.value,
-            ocr_confidence=confidence,
-            raw_ocr_text=raw_text,
-            **extracted_data
+            ocr_status=OCRStatus.COMPLETED,
+            ocr_confidence=result.confidence,
+            raw_ocr_text=result.raw_text,
         )
-        saved_biodata = await db.create(biodata)
-
-        # Index for similarity search and sync to Neo4j graph
-        if status == OCRStatus.COMPLETED:
-            try:
-                await similarity_service.index_biodata(saved_biodata)
-            except Exception as e:
-                logger.warning(f"Failed to index biodata {saved_biodata.id}: {e}")
-
-            # Sync to Neo4j graph database
-            try:
-                await graph_service.add_biodata(saved_biodata)
-            except Exception as e:
-                logger.warning(f"Failed to sync biodata {saved_biodata.id} to Neo4j: {e}")
-
-        return {
-            "id": saved_biodata.id,
-            "filename": filename,
-            "status": status.value,
-            "message": f"Processed with {confidence:.0%} confidence"
-        }
-
+        saved = await db.create(biodata)
+        return UploadResponse(
+            id=saved.id,
+            filename=filename,
+            status=OCRStatus.COMPLETED,
+            message=f"Processed with {result.confidence:.0%} confidence",
+        )
     except Exception as e:
-        # Emergency cleanup
-        try:
-            await storage_service.delete_file(file_path)
-        except:
-            pass
-        logger.error(f"Error processing {filename}: {e}")
-        return {
-            "id": "",
-            "filename": filename,
-            "status": OCRStatus.FAILED.value,
-            "message": str(e)[:200]
-        }
+        logger.error(f"OCR failed for {filename}: {e}")
+        await storage_service.delete_file(file_path)
+        return failed(filename, f"OCR failed: {str(e)[:200]}")
 
 
-async def process_single_upload(
-    file: UploadFile,
-    model: Optional[str] = None
-) -> UploadResponse:
-    """Process a single file upload with validation and OCR."""
+async def process_upload(file: UploadFile, model: Optional[str]) -> UploadResponse:
+    """Validate, store and OCR one upload."""
     filename = file.filename or "unknown"
-
-    # Validate extension
-    is_valid, ext, error = validate_file_extension(filename)
-    if not is_valid:
-        return UploadResponse(
-            id="",
-            filename=filename,
-            status=OCRStatus.FAILED,
-            message=error
-        )
-
-    # Read and validate size
-    content = await file.read()
-    is_valid, error = validate_file_size(content)
-    if not is_valid:
-        return UploadResponse(
-            id="",
-            filename=filename,
-            status=OCRStatus.FAILED,
-            message=error
-        )
-
     try:
-        # Save file
-        file_path = await storage_service.save_file_content(content, filename)
+        content, _ = await read_valid_upload(file)
+    except ValueError as e:
+        return failed(filename, str(e))
+    file_path = await storage_service.save_file_content(content, filename)
+    return await ingest_file(file_path, filename, model)
 
-        # Process atomically
-        result = await process_file_atomic(file_path, filename, model)
 
-        return UploadResponse(
-            id=result["id"],
-            filename=result["filename"],
-            status=OCRStatus(result["status"]),
-            message=result["message"]
-        )
-
-    except Exception as e:
-        return UploadResponse(
-            id="",
+async def run_batch(job: BatchJob, items: List[Tuple[str, str]], model: Optional[str]):
+    """Background worker: OCR every (file_path, filename); the queue bounds concurrency."""
+    async def process_one(file_path: str, filename: str):
+        if job.cancelled:
+            await storage_service.delete_file(file_path)
+            return
+        result = await ingest_file(file_path, filename, model)
+        ok = result.status != OCRStatus.FAILED
+        await queue_service.update_batch_progress(
+            job,
+            success=ok,
+            result=result.model_dump(mode="json") if ok else None,
+            error=None if ok else result.message,
             filename=filename,
-            status=OCRStatus.FAILED,
-            message=str(e)
         )
 
+    await asyncio.gather(*(process_one(path, name) for path, name in items))
+    logger.info(f"Batch {job.id} finished: {job.successful}/{job.total} successful")
 
-# ==================== API Endpoints ====================
+
+async def queue_files(files: List[UploadFile], model: Optional[str], background_tasks: BackgroundTasks) -> dict:
+    """Validate and store files, then schedule OCR in the background."""
+    stored: List[Tuple[str, str]] = []
+    errors: List[dict] = []
+    for file in files:
+        filename = file.filename or "unknown"
+        try:
+            content, _ = await read_valid_upload(file)
+        except ValueError as e:
+            errors.append({"filename": filename, "error": str(e)})
+            continue
+        stored.append((await storage_service.save_file_content(content, filename), filename))
+
+    job = await queue_service.create_batch_job(len(stored) + len(errors))
+    for err in errors:
+        await queue_service.update_batch_progress(job, success=False, error=err["error"], filename=err["filename"])
+
+    background_tasks.add_task(run_batch, job, stored, model)
+    return {
+        "job_id": job.id,
+        "total": len(files),
+        "queued": len(stored),
+        "validation_errors": len(errors),
+        "errors": errors[:10],
+        "message": f"Processing {len(stored)} files in background",
+    }
+
+
+# ==================== Endpoints ====================
 
 @router.get("/models")
 async def get_available_models():
-    """Get list of available Gemini models for OCR."""
+    """OCR models the user can choose from."""
     return {
-        "models": OCRService.get_available_models(),
-        "default": settings.VERTEX_MODEL,
-        "provider": settings.LLM_PROVIDER,
+        "models": ocr_service.available_models(),
+        "default": ocr_service.default_model(),
+        "provider": ocr_service.provider_name,
     }
 
 
 @router.post("/single", response_model=UploadResponse)
 async def upload_single_file(
     file: UploadFile = File(...),
-    model: Optional[str] = Query(None, description="Gemini model to use for OCR")
+    model: Optional[str] = Query(None, description="Model to use for OCR"),
 ):
-    """Upload a single biodata PDF/image file."""
-    result = await process_single_upload(file, model=model)
-    if result.status == OCRStatus.FAILED and not result.id:
+    """Upload and OCR a single biodata PDF/image (waits for the result)."""
+    result = await process_upload(file, checked_model(model))
+    if result.status == OCRStatus.FAILED:
         raise HTTPException(status_code=400, detail=result.message)
     return result
 
@@ -209,294 +166,86 @@ async def upload_single_file(
 @router.post("/bulk", response_model=BulkUploadResponse)
 async def upload_bulk_files(
     files: List[UploadFile] = File(...),
-    model: Optional[str] = Query(None, description="Gemini model to use for OCR")
+    model: Optional[str] = Query(None, description="Model to use for OCR"),
 ):
-    """
-    Upload multiple biodata files (synchronous, up to 50 files).
-    For larger batches, use /bulk/async endpoint.
-
-    Features:
-    - Rate limiting to avoid API quota errors
-    - Automatic retry on transient failures
-    - Failed files are NOT added to database
-    """
-    if len(files) > 50:
+    """Upload up to 50 files and wait for all results. Use /async/bulk for larger batches."""
+    if len(files) > MAX_SYNC_BULK_FILES:
         raise HTTPException(
             status_code=400,
-            detail="Maximum 50 files for sync upload. Use /bulk/async for larger batches."
+            detail=f"Maximum {MAX_SYNC_BULK_FILES} files for sync upload. Use /api/upload/async/bulk.",
         )
-
-    # Process all files in parallel (rate limiting handled internally)
-    tasks = [process_single_upload(file, model) for file in files]
-    results = await asyncio.gather(*tasks)
-
+    model = checked_model(model)
+    results = await asyncio.gather(*(process_upload(f, model) for f in files))
     successful = sum(1 for r in results if r.status != OCRStatus.FAILED)
-    failed = len(results) - successful
-
     return BulkUploadResponse(
-        total=len(results),
-        successful=successful,
-        failed=failed,
-        uploads=results
+        total=len(results), successful=successful, failed=len(results) - successful, uploads=list(results)
     )
 
 
-@router.post("/bulk/async")
+@router.post("/async/bulk")
 async def upload_bulk_async(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    model: Optional[str] = Query(None, description="Gemini model to use for OCR")
+    model: Optional[str] = Query(None, description="Model to use for OCR"),
 ):
     """
-    Upload large batches (100+ files) with async background processing.
-
-    Features:
-    - Handles 100-200 files efficiently
-    - Rate limiting (50 RPM default)
-    - Automatic retry with exponential backoff
-    - Circuit breaker to prevent cascade failures
-    - Chunked processing (10 files per chunk)
-    - Progress tracking via /batch/{job_id}/status
-    - Failed files are automatically cleaned up (not added to DB)
-
-    Returns:
-    - job_id: Use this to track progress via /batch/{job_id}/status
+    Upload a large batch (up to MAX_BULK_FILES) for background processing.
+    Track progress with GET /api/upload/batch/{job_id}/status.
     """
     if len(files) > settings.MAX_BULK_FILES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Maximum {settings.MAX_BULK_FILES} files per bulk upload."
-        )
-
-    # Step 1: Quickly validate and save all files
-    file_data_list: List[tuple] = []  # (FileData, file_path)
-    validation_errors: List[Dict[str, str]] = []
-
-    for file in files:
-        filename = file.filename or "unknown"
-
-        # Validate extension
-        is_valid, ext, error = validate_file_extension(filename)
-        if not is_valid:
-            validation_errors.append({"filename": filename, "error": error})
-            continue
-
-        # Read content
-        content = await file.read()
-
-        # Validate size
-        is_valid, error = validate_file_size(content)
-        if not is_valid:
-            validation_errors.append({"filename": filename, "error": error})
-            continue
-
-        # Save file immediately (fast operation)
-        try:
-            file_path = await storage_service.save_file_content(content, filename)
-            file_data_list.append((
-                FileData(content=content, filename=filename, extension=ext),
-                file_path
-            ))
-        except Exception as e:
-            validation_errors.append({"filename": filename, "error": str(e)})
-
-    # Create batch job
-    job = await queue_service.create_batch_job(len(file_data_list) + len(validation_errors))
-
-    # Add validation errors to job
-    for err in validation_errors:
-        await queue_service.update_batch_progress(
-            job,
-            success=False,
-            error=err["error"],
-            filename=err["filename"]
-        )
-
-    # Step 2: Schedule background OCR processing
-    async def process_batch():
-        """Process all files in controlled chunks."""
-        chunk_size = settings.BATCH_CHUNK_SIZE
-
-        for i in range(0, len(file_data_list), chunk_size):
-            chunk = file_data_list[i:i + chunk_size]
-
-            # Process chunk in parallel
-            async def process_one(item: tuple):
-                file_data, file_path = item
-                try:
-                    result = await process_file_atomic(file_path, file_data.filename, model)
-                    success = result["status"] != OCRStatus.FAILED.value
-                    await queue_service.update_batch_progress(
-                        job,
-                        success=success,
-                        result=result if success else None,
-                        error=result["message"] if not success else None,
-                        filename=file_data.filename
-                    )
-                except Exception as e:
-                    # Cleanup on crash
-                    try:
-                        await storage_service.delete_file(file_path)
-                    except:
-                        pass
-                    await queue_service.update_batch_progress(
-                        job,
-                        success=False,
-                        error=str(e),
-                        filename=file_data.filename
-                    )
-
-            tasks = [process_one(item) for item in chunk]
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Small delay between chunks
-            if i + chunk_size < len(file_data_list):
-                await asyncio.sleep(0.2)
-
-        logger.info(f"Batch {job.id} completed: {job.successful}/{job.total} successful")
-
-    background_tasks.add_task(process_batch)
-
-    return {
-        "job_id": job.id,
-        "total": len(files),
-        "queued": len(file_data_list),
-        "validation_errors": len(validation_errors),
-        "errors": validation_errors[:10],  # First 10 errors
-        "message": f"Processing {len(file_data_list)} files in background. Track progress at /batch/{job.id}/status"
-    }
-
-
-@router.get("/batch/{job_id}/status")
-async def get_batch_status(job_id: str):
-    """
-    Get the status of a batch upload job.
-
-    Returns:
-    - Progress percentage
-    - Success/failure counts
-    - Recent errors (if any)
-    - Overall status (processing/completed/partial/failed)
-    """
-    job = await queue_service.get_batch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Batch job not found")
-
-    return job.to_dict()
-
-
-@router.get("/batch/{job_id}/results")
-async def get_batch_results(job_id: str):
-    """
-    Get the results of a completed batch job.
-    Includes list of successfully processed biodata IDs.
-    """
-    job = await queue_service.get_batch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Batch job not found")
-
-    return {
-        **job.to_dict(),
-        "results": job.results,  # Full results for completed items
-    }
+        raise HTTPException(status_code=400, detail=f"Maximum {settings.MAX_BULK_FILES} files per bulk upload.")
+    return await queue_files(files, checked_model(model), background_tasks)
 
 
 @router.post("/async/single")
 async def upload_single_async(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    model: Optional[str] = Query(None, description="Gemini model to use for OCR")
+    model: Optional[str] = Query(None, description="Model to use for OCR"),
 ):
-    """
-    Upload a single file for async processing.
-    Returns immediately with a pending status.
-    """
-    filename = file.filename or "unknown"
+    """Upload one file for background processing; returns a job id immediately."""
+    return await queue_files([file], checked_model(model), background_tasks)
 
-    # Validate extension
-    is_valid, ext, error = validate_file_extension(filename)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=error)
 
-    # Read and validate size
-    content = await file.read()
-    is_valid, error = validate_file_size(content)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=error)
+async def _get_job(job_id: str) -> BatchJob:
+    job = await queue_service.get_batch_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Batch job not found")
+    return job
 
-    # Save file
-    file_path = await storage_service.save_file_content(content, filename)
 
-    # Create batch job for single file
-    job = await queue_service.create_batch_job(1)
+@router.get("/batch/{job_id}/status")
+async def get_batch_status(job_id: str):
+    """Progress, counts, recent errors and overall status of a batch job."""
+    return (await _get_job(job_id)).to_dict()
 
-    async def process_single():
-        try:
-            result = await process_file_atomic(file_path, filename, model)
-            success = result["status"] != OCRStatus.FAILED.value
-            await queue_service.update_batch_progress(
-                job,
-                success=success,
-                result=result if success else None,
-                error=result["message"] if not success else None,
-                filename=filename
-            )
-        except Exception as e:
-            try:
-                await storage_service.delete_file(file_path)
-            except:
-                pass
-            await queue_service.update_batch_progress(
-                job,
-                success=False,
-                error=str(e),
-                filename=filename
-            )
 
-    background_tasks.add_task(process_single)
-
-    return {
-        "job_id": job.id,
-        "filename": filename,
-        "status": "pending",
-        "message": f"Processing in background. Track at /batch/{job.id}/status"
-    }
+@router.get("/batch/{job_id}/results")
+async def get_batch_results(job_id: str):
+    """Batch status plus the per-file results of successful items."""
+    job = await _get_job(job_id)
+    return {**job.to_dict(), "results": job.results}
 
 
 @router.delete("/batch/{job_id}")
 async def cancel_batch_job(job_id: str):
-    """
-    Cancel a batch job (cleanup tracking data).
-    Note: Already-submitted OCR tasks cannot be cancelled.
-    """
-    job = await queue_service.get_batch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Batch job not found")
-
-    # Mark as failed if still processing
-    if job.status == BatchStatus.PROCESSING:
-        job.status = BatchStatus.FAILED
-        from datetime import datetime
-        job.completed_at = datetime.utcnow()
-
-    return {"message": "Batch job cancelled", "job_id": job_id}
+    """Cancel a batch: files not yet sent to OCR are skipped and deleted."""
+    job = await _get_job(job_id)
+    await queue_service.cancel_batch_job(job)
+    return {"message": "Batch job cancelled", "job_id": job_id, "status": job.status.value}
 
 
 @router.get("/queue/stats")
 async def get_queue_stats():
-    """
-    Get current queue statistics.
-    Useful for monitoring system load.
-    """
+    """Current queue/rate-limiter state, for monitoring."""
     return {
         "circuit_breaker_state": queue_service.circuit_breaker.state,
         "circuit_breaker_failures": queue_service.circuit_breaker.failures,
-        "rate_limit_tokens": queue_service.rate_limiter.tokens,
+        "rate_limit_tokens": round(queue_service.rate_limiter.tokens, 2),
         "rate_limit_capacity": queue_service.rate_limiter.capacity,
         "config": {
             "concurrency": settings.QUEUE_CONCURRENCY,
             "requests_per_minute": settings.REQUESTS_PER_MINUTE,
-            "batch_chunk_size": settings.BATCH_CHUNK_SIZE,
             "max_bulk_files": settings.MAX_BULK_FILES,
-        }
+        },
     }

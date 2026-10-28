@@ -1,435 +1,263 @@
 """
-Graph Service - Neo4j-based graph database for relationship-based similarity search.
-Creates a knowledge graph of biodatas with relationships based on shared attributes.
+Graph Service - optional Neo4j knowledge graph of approved biodatas.
+
+Person nodes link to attribute nodes (Religion, Caste, Location, Education,
+Occupation). Two persons sharing at least two attributes get a SIMILAR_TO edge.
+Every method is a safe no-op when Neo4j is not configured or unreachable.
 """
-from typing import List, Dict, Any, Optional, Tuple
-from neo4j import GraphDatabase, Driver
+import asyncio
 import logging
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.config import settings
 from backend.models import BiodataInDB
 
 logger = logging.getLogger(__name__)
 
+# How long to wait before retrying a failed connection
+_RECONNECT_BACKOFF_SECONDS = 60.0
+
+# (relationship type, node label, biodata attribute getter)
+_ATTRIBUTES = [
+    ("HAS_RELIGION", "Religion", lambda b: b.religion),
+    ("HAS_CASTE", "Caste", lambda b: b.caste),
+    ("LIVES_IN", "Location", lambda b: b.current_city or b.state),
+    ("HAS_EDUCATION", "Education", lambda b: b.education),
+    ("WORKS_AS", "Occupation", lambda b: b.occupation),
+]
+_ATTRIBUTE_RELS = "|".join(rel for rel, _, _ in _ATTRIBUTES)
+_MIN_SHARED_FOR_SIMILAR = 2
+
+
+def _normalize(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = " ".join(value.lower().split())[:60]
+    return value or None
+
 
 class GraphService:
-    """
-    Neo4j-based graph service for biodata relationships and similarity search.
-    Creates nodes for Persons and attribute nodes (Religion, Caste, Location, etc.)
-    with relationships between them.
-    """
+    """Neo4j-backed relationship graph."""
 
     def __init__(self):
-        self._driver: Optional[Driver] = None
-        self._initialized = False
+        self._driver = None
+        self._last_failure: float = 0.0
 
-    def _get_driver(self) -> Optional[Driver]:
-        """Get or create Neo4j driver connection."""
+    @property
+    def configured(self) -> bool:
+        return bool(settings.NEO4J_URI and settings.NEO4J_USERNAME)
+
+    def _get_driver(self):
+        """Get or lazily create the driver; backs off after a failed attempt."""
         if self._driver is not None:
             return self._driver
-
-        if not settings.NEO4J_URI or not settings.NEO4J_USERNAME:
-            logger.warning("Neo4j not configured. Set NEO4J_URI and credentials in .env")
+        if not self.configured:
             return None
+        if time.monotonic() - self._last_failure < _RECONNECT_BACKOFF_SECONDS:
+            return None
+        try:
+            from neo4j import GraphDatabase
+            driver = GraphDatabase.driver(
+                settings.NEO4J_URI, auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD)
+            )
+            driver.verify_connectivity()
+            self._driver = driver
+            logger.info("Connected to Neo4j")
+        except Exception as e:
+            self._last_failure = time.monotonic()
+            logger.error(f"Failed to connect to Neo4j: {e}")
+        return self._driver
+
+    async def _run(self, work: Callable[[Any], Any], default: Any) -> Any:
+        """Run a blocking session callback in a worker thread."""
+        def task():
+            driver = self._get_driver()
+            if driver is None:
+                return default
+            with driver.session(database=settings.NEO4J_DATABASE) as session:
+                return work(session)
 
         try:
-            self._driver = GraphDatabase.driver(
-                settings.NEO4J_URI,
-                auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD)
-            )
-            self._driver.verify_connectivity()
-            self._initialized = True
-            logger.info("Connected to Neo4j successfully")
-            return self._driver
+            return await asyncio.to_thread(task)
         except Exception as e:
-            logger.error(f"Failed to connect to Neo4j: {e}")
-            return None
+            logger.error(f"Neo4j operation failed: {e}")
+            return default
 
     def close(self):
-        """Close the Neo4j driver connection."""
         if self._driver:
             self._driver.close()
             self._driver = None
-            self._initialized = False
 
-    async def initialize_schema(self):
-        """Create indexes and constraints for better performance."""
-        driver = self._get_driver()
-        if not driver:
-            return False
-
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                # Create indexes for faster lookups
-                session.run("CREATE INDEX person_id IF NOT EXISTS FOR (p:Person) ON (p.biodata_id)")
-                session.run("CREATE INDEX religion_name IF NOT EXISTS FOR (r:Religion) ON (r.name)")
-                session.run("CREATE INDEX caste_name IF NOT EXISTS FOR (c:Caste) ON (c.name)")
-                session.run("CREATE INDEX location_name IF NOT EXISTS FOR (l:Location) ON (l.name)")
-                session.run("CREATE INDEX education_name IF NOT EXISTS FOR (e:Education) ON (e.name)")
-                session.run("CREATE INDEX occupation_name IF NOT EXISTS FOR (o:Occupation) ON (o.name)")
+    async def initialize_schema(self) -> bool:
+        """Create a uniqueness constraint and lookup indexes."""
+        def work(session):
+            session.run("CREATE CONSTRAINT person_id IF NOT EXISTS FOR (p:Person) REQUIRE p.biodata_id IS UNIQUE")
+            for _, label, _ in _ATTRIBUTES:
+                session.run(f"CREATE INDEX {label.lower()}_name IF NOT EXISTS FOR (n:{label}) ON (n.name)")
             return True
-        except Exception as e:
-            logger.error(f"Failed to initialize schema: {e}")
-            return False
+        return await self._run(work, False)
 
     async def add_biodata(self, biodata: BiodataInDB) -> bool:
-        """
-        Add a biodata to the graph database.
-        Creates Person node and relationships to attribute nodes.
-        """
-        driver = self._get_driver()
-        if not driver:
-            return False
+        """Create or refresh a Person node, its attribute links and SIMILAR_TO edges."""
+        attributes = [
+            {"rel": rel, "label": label, "name": _normalize(get(biodata))}
+            for rel, label, get in _ATTRIBUTES
+        ]
 
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                # Create or merge Person node
-                session.run("""
+        def work(session):
+            def tx_work(tx):
+                tx.run(
+                    """
                     MERGE (p:Person {biodata_id: $id})
-                    SET p.name = $name,
-                        p.age = $age,
-                        p.gender = $gender,
-                        p.education = $education,
-                        p.occupation = $occupation,
-                        p.religion = $religion,
-                        p.caste = $caste,
-                        p.location = $location,
-                        p.created_at = datetime()
-                """,
+                    SET p.name = $name, p.age = $age, p.gender = $gender,
+                        p.religion = $religion, p.caste = $caste, p.location = $location,
+                        p.education = $education, p.occupation = $occupation
+                    WITH p
+                    OPTIONAL MATCH (p)-[old]-()
+                    WHERE type(old) IN $rel_types OR type(old) = 'SIMILAR_TO'
+                    DELETE old
+                    """,
                     id=biodata.id,
                     name=biodata.name or "Unknown",
                     age=biodata.age,
                     gender=biodata.gender.value if biodata.gender else None,
-                    education=biodata.education,
-                    occupation=biodata.occupation,
                     religion=biodata.religion,
                     caste=biodata.caste,
-                    location=biodata.current_city or biodata.state
+                    location=biodata.current_city or biodata.state,
+                    education=biodata.education,
+                    occupation=biodata.occupation,
+                    rel_types=[rel for rel, _, _ in _ATTRIBUTES],
                 )
-
-                # Create relationships to attribute nodes
-                if biodata.religion:
-                    session.run("""
-                        MATCH (p:Person {biodata_id: $id})
-                        MERGE (r:Religion {name: $religion})
-                        MERGE (p)-[:HAS_RELIGION]->(r)
-                    """, id=biodata.id, religion=biodata.religion.lower().strip())
-
-                if biodata.caste:
-                    session.run("""
-                        MATCH (p:Person {biodata_id: $id})
-                        MERGE (c:Caste {name: $caste})
-                        MERGE (p)-[:HAS_CASTE]->(c)
-                    """, id=biodata.id, caste=biodata.caste.lower().strip())
-
-                if biodata.current_city or biodata.state:
-                    location = (biodata.current_city or biodata.state).lower().strip()
-                    session.run("""
-                        MATCH (p:Person {biodata_id: $id})
-                        MERGE (l:Location {name: $location})
-                        MERGE (p)-[:LIVES_IN]->(l)
-                    """, id=biodata.id, location=location)
-
-                if biodata.education:
-                    session.run("""
-                        MATCH (p:Person {biodata_id: $id})
-                        MERGE (e:Education {name: $education})
-                        MERGE (p)-[:HAS_EDUCATION]->(e)
-                    """, id=biodata.id, education=biodata.education.lower().strip()[:50])
-
-                if biodata.occupation:
-                    session.run("""
-                        MATCH (p:Person {biodata_id: $id})
-                        MERGE (o:Occupation {name: $occupation})
-                        MERGE (p)-[:WORKS_AS]->(o)
-                    """, id=biodata.id, occupation=biodata.occupation.lower().strip()[:50])
-
-                # Create SIMILAR_TO relationships with other persons sharing attributes
-                session.run("""
-                    MATCH (p1:Person {biodata_id: $id})
-                    MATCH (p2:Person)
+                for attr in attributes:
+                    if attr["name"]:
+                        # Labels/types can't be parameterized; they come from our constant list
+                        tx.run(
+                            f"MATCH (p:Person {{biodata_id: $id}}) "
+                            f"MERGE (a:{attr['label']} {{name: $name}}) "
+                            f"MERGE (p)-[:{attr['rel']}]->(a)",
+                            id=biodata.id, name=attr["name"],
+                        )
+                tx.run(
+                    f"""
+                    MATCH (p1:Person {{biodata_id: $id}})-[:{_ATTRIBUTE_RELS}]->(a)<-[:{_ATTRIBUTE_RELS}]-(p2:Person)
                     WHERE p1 <> p2
-                    AND (
-                        (p1)-[:HAS_RELIGION]->()<-[:HAS_RELIGION]-(p2) OR
-                        (p1)-[:HAS_CASTE]->()<-[:HAS_CASTE]-(p2) OR
-                        (p1)-[:LIVES_IN]->()<-[:LIVES_IN]-(p2)
-                    )
+                    WITH p1, p2, count(DISTINCT a) AS shared
+                    WHERE shared >= $min_shared
                     MERGE (p1)-[s:SIMILAR_TO]-(p2)
-                    SET s.updated_at = datetime()
-                """, id=biodata.id)
-
+                    SET s.shared = shared
+                    """,
+                    id=biodata.id, min_shared=_MIN_SHARED_FOR_SIMILAR,
+                )
+            session.execute_write(tx_work)
             return True
-        except Exception as e:
-            logger.error(f"Failed to add biodata to graph: {e}")
-            return False
+        return await self._run(work, False)
+
+    async def sync(self, biodata: BiodataInDB) -> bool:
+        """Keep the graph in step with a record: only approved biodatas belong in it."""
+        if biodata.is_approved:
+            return await self.add_biodata(biodata)
+        return await self.remove_biodata(biodata.id)
 
     async def remove_biodata(self, biodata_id: str) -> bool:
-        """Remove a biodata from the graph database."""
-        driver = self._get_driver()
-        if not driver:
-            return False
-
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                session.run("""
-                    MATCH (p:Person {biodata_id: $id})
-                    DETACH DELETE p
-                """, id=biodata_id)
+        def work(session):
+            session.run("MATCH (p:Person {biodata_id: $id}) DETACH DELETE p", id=biodata_id)
             return True
-        except Exception as e:
-            logger.error(f"Failed to remove biodata from graph: {e}")
-            return False
+        return await self._run(work, False)
 
     async def find_similar(self, biodata_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """
-        Find similar biodatas using graph traversal.
-        Returns persons with shared attributes and similarity score.
-        """
-        driver = self._get_driver()
-        if not driver:
-            return []
-
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                result = session.run("""
-                    MATCH (p1:Person {biodata_id: $id})
-                    MATCH (p2:Person)
-                    WHERE p1 <> p2
-                    OPTIONAL MATCH (p1)-[:HAS_RELIGION]->(r:Religion)<-[:HAS_RELIGION]-(p2)
-                    OPTIONAL MATCH (p1)-[:HAS_CASTE]->(c:Caste)<-[:HAS_CASTE]-(p2)
-                    OPTIONAL MATCH (p1)-[:LIVES_IN]->(l:Location)<-[:LIVES_IN]-(p2)
-                    OPTIONAL MATCH (p1)-[:HAS_EDUCATION]->(e:Education)<-[:HAS_EDUCATION]-(p2)
-                    OPTIONAL MATCH (p1)-[:WORKS_AS]->(o:Occupation)<-[:WORKS_AS]-(p2)
-                    WITH p2,
-                         CASE WHEN r IS NOT NULL THEN 1 ELSE 0 END AS religion_match,
-                         CASE WHEN c IS NOT NULL THEN 1 ELSE 0 END AS caste_match,
-                         CASE WHEN l IS NOT NULL THEN 1 ELSE 0 END AS location_match,
-                         CASE WHEN e IS NOT NULL THEN 1 ELSE 0 END AS education_match,
-                         CASE WHEN o IS NOT NULL THEN 1 ELSE 0 END AS occupation_match,
-                         r.name AS shared_religion,
-                         c.name AS shared_caste,
-                         l.name AS shared_location
-                    WITH p2,
-                         (religion_match * 0.25 + caste_match * 0.2 + location_match * 0.2 +
-                          education_match * 0.2 + occupation_match * 0.15) AS score,
-                         shared_religion, shared_caste, shared_location
-                    WHERE score > 0
-                    RETURN p2.biodata_id AS id,
-                           p2.name AS name,
-                           p2.age AS age,
-                           p2.gender AS gender,
-                           p2.religion AS religion,
-                           p2.caste AS caste,
-                           p2.location AS location,
-                           p2.education AS education,
-                           p2.occupation AS occupation,
-                           score,
-                           shared_religion,
-                           shared_caste,
-                           shared_location
-                    ORDER BY score DESC
-                    LIMIT $limit
-                """, id=biodata_id, limit=limit)
-
-                return [dict(record) for record in result]
-        except Exception as e:
-            logger.error(f"Failed to find similar biodatas: {e}")
-            return []
+        """Persons sharing attributes with the given biodata, ranked by weighted overlap."""
+        def work(session):
+            result = session.run(
+                f"""
+                MATCH (p1:Person {{biodata_id: $id}})-[r1:{_ATTRIBUTE_RELS}]->(a)<-[r2]-(p2:Person)
+                WHERE p1 <> p2 AND type(r1) = type(r2)
+                WITH p2, collect(DISTINCT type(r1)) AS rels, collect(DISTINCT a.name) AS shared
+                WITH p2, shared,
+                     reduce(s = 0.0, r IN rels | s + CASE r
+                        WHEN 'HAS_RELIGION' THEN 0.25 WHEN 'HAS_CASTE' THEN 0.2
+                        WHEN 'LIVES_IN' THEN 0.2 WHEN 'HAS_EDUCATION' THEN 0.2
+                        ELSE 0.15 END) AS score
+                RETURN p2.biodata_id AS id, p2.name AS name, p2.age AS age, p2.gender AS gender,
+                       p2.location AS location, score, shared
+                ORDER BY score DESC
+                LIMIT $limit
+                """,
+                id=biodata_id, limit=limit,
+            )
+            return [dict(record) for record in result]
+        return await self._run(work, [])
 
     async def get_graph_data(self, biodata_id: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
         """
-        Get graph data for visualization.
-        Returns nodes and edges suitable for D3.js or similar libraries.
+        Nodes and edges for visualization. With `biodata_id`, returns that person
+        and their SIMILAR_TO neighbours; otherwise up to `limit` persons.
         """
-        driver = self._get_driver()
-        if not driver:
+        def work(session):
+            persons = session.run(
+                f"""
+                MATCH (p:Person)
+                WHERE $id IS NULL OR p.biodata_id = $id
+                   OR EXISTS {{ (p)-[:SIMILAR_TO]-(:Person {{biodata_id: $id}}) }}
+                WITH p LIMIT $limit
+                OPTIONAL MATCH (p)-[r:{_ATTRIBUTE_RELS}]->(a)
+                RETURN p.biodata_id AS id, p.name AS name, p.age AS age, p.gender AS gender,
+                       collect(CASE WHEN a IS NULL THEN NULL
+                               ELSE {{rel: type(r), label: labels(a)[0], name: a.name}} END) AS attrs
+                """,
+                id=biodata_id, limit=limit,
+            ).data()
+            ids = [p["id"] for p in persons]
+            similar = session.run(
+                """
+                MATCH (a:Person)-[s:SIMILAR_TO]-(b:Person)
+                WHERE a.biodata_id IN $ids AND b.biodata_id IN $ids AND a.biodata_id < b.biodata_id
+                RETURN a.biodata_id AS source, b.biodata_id AS target, s.shared AS shared
+                """,
+                ids=ids,
+            ).data()
+            return persons, similar
+
+        result = await self._run(work, None)
+        if result is None:
             return {"nodes": [], "edges": []}
+        persons, similar = result
 
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                if biodata_id:
-                    # Get subgraph centered on specific biodata
-                    result = session.run("""
-                        MATCH (p1:Person {biodata_id: $id})
-                        OPTIONAL MATCH (p1)-[r1]->(attr)
-                        OPTIONAL MATCH (p1)-[:SIMILAR_TO]-(p2:Person)
-                        OPTIONAL MATCH (p2)-[r2]->(attr2)
-                        WITH collect(DISTINCT p1) + collect(DISTINCT p2) AS persons,
-                             collect(DISTINCT attr) + collect(DISTINCT attr2) AS attrs,
-                             collect(DISTINCT {source: p1.biodata_id, target: id(attr), type: type(r1)}) +
-                             collect(DISTINCT {source: p2.biodata_id, target: id(attr2), type: type(r2)}) +
-                             collect(DISTINCT {source: p1.biodata_id, target: p2.biodata_id, type: 'SIMILAR_TO'}) AS rels
-                        UNWIND persons AS person
-                        WITH person, attrs, rels
-                        RETURN collect(DISTINCT {
-                            id: person.biodata_id,
-                            label: person.name,
-                            type: 'Person',
-                            age: person.age,
-                            gender: person.gender,
-                            religion: person.religion,
-                            caste: person.caste,
-                            location: person.location
-                        }) AS person_nodes,
-                        attrs, rels
-                        LIMIT 1
-                    """, id=biodata_id)
-                else:
-                    # Get full graph (limited)
-                    result = session.run("""
-                        MATCH (p:Person)
-                        OPTIONAL MATCH (p)-[:HAS_RELIGION]->(r:Religion)
-                        OPTIONAL MATCH (p)-[:HAS_CASTE]->(c:Caste)
-                        OPTIONAL MATCH (p)-[:LIVES_IN]->(l:Location)
-                        OPTIONAL MATCH (p)-[:SIMILAR_TO]-(p2:Person)
-                        WITH p, r, c, l, collect(DISTINCT p2.biodata_id) AS similar_ids
-                        RETURN p.biodata_id AS id,
-                               p.name AS name,
-                               p.age AS age,
-                               p.gender AS gender,
-                               p.religion AS religion,
-                               p.caste AS caste,
-                               p.location AS location,
-                               r.name AS religion_node,
-                               c.name AS caste_node,
-                               l.name AS location_node,
-                               similar_ids
-                        LIMIT $limit
-                    """, limit=limit)
+        nodes: Dict[str, Dict[str, Any]] = {}
+        edges: List[Dict[str, Any]] = []
+        for person in persons:
+            nodes[person["id"]] = {
+                "id": person["id"],
+                "label": person["name"] or "Unknown",
+                "type": "Person",
+                "gender": person["gender"],
+                "age": person["age"],
+            }
+            for attr in person["attrs"]:
+                attr_id = f"{attr['label'].lower()}:{attr['name']}"
+                nodes.setdefault(attr_id, {"id": attr_id, "label": attr["name"].title(), "type": attr["label"]})
+                edges.append({"source": person["id"], "target": attr_id, "type": attr["rel"]})
+        for s in similar:
+            edges.append({"source": s["source"], "target": s["target"], "type": "SIMILAR_TO", "shared": s["shared"]})
 
-                records = list(result)
-
-                nodes = []
-                edges = []
-                node_ids = set()
-
-                for record in records:
-                    rec = dict(record)
-                    person_id = rec['id']
-
-                    # Add person node
-                    if person_id not in node_ids:
-                        nodes.append({
-                            "id": person_id,
-                            "label": rec['name'] or "Unknown",
-                            "type": "Person",
-                            "age": rec['age'],
-                            "gender": rec['gender'],
-                            "religion": rec['religion'],
-                            "caste": rec['caste'],
-                            "location": rec['location']
-                        })
-                        node_ids.add(person_id)
-
-                    # Add attribute nodes and edges
-                    if rec.get('religion_node'):
-                        attr_id = f"religion_{rec['religion_node']}"
-                        if attr_id not in node_ids:
-                            nodes.append({
-                                "id": attr_id,
-                                "label": rec['religion_node'].title(),
-                                "type": "Religion"
-                            })
-                            node_ids.add(attr_id)
-                        edges.append({
-                            "source": person_id,
-                            "target": attr_id,
-                            "type": "HAS_RELIGION"
-                        })
-
-                    if rec.get('caste_node'):
-                        attr_id = f"caste_{rec['caste_node']}"
-                        if attr_id not in node_ids:
-                            nodes.append({
-                                "id": attr_id,
-                                "label": rec['caste_node'].title(),
-                                "type": "Caste"
-                            })
-                            node_ids.add(attr_id)
-                        edges.append({
-                            "source": person_id,
-                            "target": attr_id,
-                            "type": "HAS_CASTE"
-                        })
-
-                    if rec.get('location_node'):
-                        attr_id = f"location_{rec['location_node']}"
-                        if attr_id not in node_ids:
-                            nodes.append({
-                                "id": attr_id,
-                                "label": rec['location_node'].title(),
-                                "type": "Location"
-                            })
-                            node_ids.add(attr_id)
-                        edges.append({
-                            "source": person_id,
-                            "target": attr_id,
-                            "type": "LIVES_IN"
-                        })
-
-                    # Add SIMILAR_TO edges
-                    for similar_id in rec.get('similar_ids', []):
-                        if similar_id and similar_id in node_ids:
-                            edge_key = tuple(sorted([person_id, similar_id]))
-                            edges.append({
-                                "source": person_id,
-                                "target": similar_id,
-                                "type": "SIMILAR_TO"
-                            })
-
-                return {"nodes": nodes, "edges": edges}
-        except Exception as e:
-            logger.error(f"Failed to get graph data: {e}")
-            return {"nodes": [], "edges": []}
+        return {"nodes": list(nodes.values()), "edges": edges}
 
     async def get_stats(self) -> Dict[str, Any]:
-        """Get graph statistics."""
-        driver = self._get_driver()
-        if not driver:
-            return {"connected": False}
+        if not self.configured:
+            return {"configured": False, "connected": False}
 
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                result = session.run("""
-                    MATCH (p:Person)
-                    WITH count(p) AS persons
-                    MATCH ()-[r:SIMILAR_TO]-()
-                    WITH persons, count(r)/2 AS similarities
-                    MATCH (r:Religion)
-                    WITH persons, similarities, count(r) AS religions
-                    MATCH (c:Caste)
-                    WITH persons, similarities, religions, count(c) AS castes
-                    MATCH (l:Location)
-                    RETURN persons, similarities, religions, castes, count(l) AS locations
-                """)
-                record = result.single()
-                if record:
-                    return {
-                        "connected": True,
-                        "persons": record["persons"],
-                        "similarities": record["similarities"],
-                        "religions": record["religions"],
-                        "castes": record["castes"],
-                        "locations": record["locations"]
-                    }
-                return {"connected": True, "persons": 0, "similarities": 0}
-        except Exception as e:
-            logger.error(f"Failed to get graph stats: {e}")
-            return {"connected": False, "error": str(e)}
-
-    async def clear_graph(self) -> bool:
-        """Clear all data from the graph database."""
-        driver = self._get_driver()
-        if not driver:
-            return False
-
-        try:
-            with driver.session(database=settings.NEO4J_DATABASE) as session:
-                session.run("MATCH (n) DETACH DELETE n")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to clear graph: {e}")
-            return False
+        def work(session):
+            record = session.run(
+                """
+                RETURN COUNT { (:Person) } AS persons,
+                       COUNT { ()-[:SIMILAR_TO]->() } AS similarities,
+                       COUNT { (:Religion) } AS religions,
+                       COUNT { (:Caste) } AS castes,
+                       COUNT { (:Location) } AS locations
+                """
+            ).single()
+            return {"configured": True, "connected": True, **dict(record)}
+        return await self._run(work, {"configured": True, "connected": False})
 
 
 # Singleton instance

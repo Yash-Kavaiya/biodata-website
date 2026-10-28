@@ -1,127 +1,101 @@
 # Biodata Management System
 
-A full-stack application for biodata OCR processing and match finding, built with FastAPI and vanilla JavaScript.
+Upload matrimonial biodata PDFs/photos, extract every field with an LLM (NVIDIA Nemotron, Gemini on Vertex AI, or Claude), review and correct the results, then find compatible matches.
 
 ## Features
 
-- **Upload**: Single or bulk PDF/image upload with async processing
-- **LLM-powered OCR**: Uses Claude to extract structured data from biodata documents
-- **Validation Workflow**: Approve, edit, re-OCR, or reject extracted data
-- **Match Finding**: Search by preferences or upload a biodata to find compatible profiles
-- **Local Storage**: JSON database and local file storage (cloud-ready architecture)
+- **Upload**: single files, multi-file, or whole folders (up to 200 files) with background processing and live progress
+- **LLM OCR**: NVIDIA Nemotron (vision model reads the page, Nemotron Ultra extracts fields), Gemini (Vertex AI) or Claude. Output is normalized (gender/marital status/age) before saving
+- **Resilient queue**: rate limiting, retries with backoff on 429/5xx/timeouts, circuit breaker, cancellable batches
+- **Validation workflow**: compare with the original document, then approve, edit (all 34 fields), re-run OCR, or reject
+- **Matching**: search by preferences, by an existing profile, or by uploading a biodata (not stored)
+- **Telegram bot** (optional): send a PDF/photo to your bot; it is OCR'd and added, with Approve / Reject buttons in the chat
+- **Graph view** (optional): Neo4j relationship graph of approved profiles
+- **Security**: optional HTTP Basic auth, uploads served only through the API, file type checked by content
 
-## Architecture
-
-```
-biodata-website/
-├── backend/
-│   ├── main.py              # FastAPI application
-│   ├── config.py            # Configuration settings
-│   ├── models/              # Pydantic models
-│   │   └── biodata.py       # Biodata schemas
-│   ├── services/            # Business logic (SOLID principles)
-│   │   ├── storage_service.py    # File storage (local/cloud)
-│   │   ├── database_service.py   # JSON database
-│   │   ├── ocr_service.py        # LLM-based OCR
-│   │   └── similarity_service.py # Match finding
-│   ├── routers/             # API endpoints
-│   │   ├── upload.py        # Upload endpoints
-│   │   ├── biodata.py       # CRUD endpoints
-│   │   ├── validation.py    # Validation workflow
-│   │   └── search.py        # Search/match endpoints
-│   └── db/                  # Database files
-│       ├── biodata.json     # Biodata storage
-│       └── embeddings.pkl   # Similarity index
-├── frontend/
-│   ├── templates/
-│   │   └── index.html       # Main HTML page
-│   └── static/
-│       ├── css/styles.css   # Styling
-│       └── js/app.js        # Frontend logic
-├── uploads/                 # Uploaded files
-├── requirements.txt
-└── .env.example
-```
-
-## Quick Start
-
-### 1. Install Dependencies
+## Quick start
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env        # set AUTH_PASSWORD and your OCR provider
+python run.py               # http://localhost:8000
 ```
 
-### 2. Configure Environment
+For NVIDIA, set `LLM_PROVIDER=nvidia` and `NVIDIA_API_KEY`. For Vertex AI, authenticate once with `gcloud auth application-default login` and set `GCP_PROJECT_ID`.
+Set `LLM_PROVIDER=local` to run without any LLM: files are stored, but no fields are extracted.
+
+API docs: http://localhost:8000/api/docs
+
+### Telegram bot
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and set `TELEGRAM_BOT_TOKEN`.
+2. Start the app and send any message to your bot. It replies with your chat ID.
+3. Add that ID to `TELEGRAM_ALLOWED_CHAT_IDS` and restart.
+
+Then send biodata PDFs or photos (as a *file* for best quality). Commands: `/stats`, `/help`.
+The bot uses long polling, so it works without a public URL. Run a single app process, since two pollers on one token conflict.
+
+## Tests
 
 ```bash
-cp .env.example .env
-# Edit .env and add your Anthropic API key
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### 3. Run the Application
+The suite runs the full workflow against the real API (upload → review → approve → match → delete) with a scripted OCR provider, in a temporary directory. It never touches your data, LLM, or Neo4j.
+
+## Docker
 
 ```bash
-# From project root
-python -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+docker build -t biodata .
+docker run -p 8080:8080 --env-file .env -v biodata-data:/app/data biodata
 ```
 
-### 4. Open in Browser
+Uploads and the JSON database live in the `/app/data` volume.
 
-Navigate to http://localhost:8000
+## Project structure
 
-## API Documentation
+```
+backend/
+  main.py                 App setup, auth middleware, startup recovery
+  config.py               Settings (env / .env)
+  models/biodata.py       Pydantic schemas
+  routers/                upload, biodata, validation, search, graph
+  services/
+    ocr_service.py        Providers + parsing/normalization/confidence
+    queue_service.py      Rate limiter, retries, circuit breaker, batch jobs
+    database_service.py   Thread-safe JSON database (atomic writes)
+    storage_service.py    Local file storage, confined to UPLOAD_DIR
+    similarity_service.py Weighted match scoring
+    graph_service.py      Optional Neo4j sync and queries
+frontend/                 AngularJS single page app
+tests/                    End-to-end and unit tests
+```
 
-- **Swagger UI**: http://localhost:8000/api/docs
-- **ReDoc**: http://localhost:8000/api/redoc
+## API
 
-## API Endpoints
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/upload/models` | Selectable OCR models |
+| POST | `/api/upload/single` | Upload and OCR one file (waits) |
+| POST | `/api/upload/bulk` | Up to 50 files (waits) |
+| POST | `/api/upload/async/bulk` | Large batch in background → `job_id` |
+| POST | `/api/upload/async/single` | One file in background → `job_id` |
+| GET | `/api/upload/batch/{id}/status` · `/results` | Batch progress / per-file results |
+| DELETE | `/api/upload/batch/{id}` | Cancel remaining files in a batch |
+| GET | `/api/biodata?page=&page_size=&status=&q=` | List with filters |
+| GET | `/api/biodata/stats` · `/pending` · `/approved` | Counts / review queue / approved |
+| GET/PUT/DELETE | `/api/biodata/{id}` | Read / update / delete |
+| GET | `/api/biodata/{id}/file` | Original document (`?download=true` to save) |
+| POST | `/api/biodata` | Create manually (pre-approved) |
+| POST | `/api/validation/approve/{id}` · `reject/{id}` · `edit/{id}` · `re-ocr/{id}` | Review actions |
+| POST | `/api/validation/auto-approve-all?min_confidence=` | Bulk approve |
+| POST | `/api/search/preferences` · `by-biodata/{id}` · `by-upload` | Matching |
+| GET | `/api/search/stats` | Approved profile summary |
+| GET | `/api/graph/data` · `stats` · `similar/{id}` | Graph (Neo4j) |
+| POST | `/api/graph/sync` | Rebuild graph from the database |
+| GET | `/api/health` | Health check (no auth) |
 
-### Upload
-- `POST /api/upload/single` - Upload single file
-- `POST /api/upload/bulk` - Upload multiple files
-- `POST /api/upload/async/single` - Async single upload
-- `POST /api/upload/async/bulk` - Async bulk upload
+## Data and privacy
 
-### Biodata
-- `GET /api/biodata` - List all biodatas
-- `GET /api/biodata/{id}` - Get biodata by ID
-- `POST /api/biodata` - Create biodata manually
-- `PUT /api/biodata/{id}` - Update biodata
-- `DELETE /api/biodata/{id}` - Delete biodata
-
-### Validation
-- `POST /api/validation/approve/{id}` - Approve OCR result
-- `POST /api/validation/reject/{id}` - Reject OCR result
-- `POST /api/validation/edit/{id}` - Edit and approve
-- `POST /api/validation/re-ocr/{id}` - Re-run OCR
-- `POST /api/validation/auto-approve-all` - Auto-approve high confidence
-
-### Search
-- `POST /api/search/preferences` - Search by preferences
-- `GET /api/search/simple` - Simple search with query params
-- `POST /api/search/by-biodata/{id}` - Find matches for a biodata
-- `POST /api/search/by-upload` - Upload and find matches
-- `GET /api/search/stats` - Get search statistics
-
-## Design Principles
-
-This project follows **SOLID principles**:
-
-- **Single Responsibility**: Each service handles one concern
-- **Open/Closed**: Easy to extend (e.g., add new storage providers)
-- **Liskov Substitution**: Storage interfaces are interchangeable
-- **Interface Segregation**: Clean, focused interfaces
-- **Dependency Inversion**: Services depend on abstractions
-
-## Future Enhancements
-
-- [ ] Cloud storage integration (Google Cloud Storage)
-- [ ] Advanced similarity search with embeddings
-- [ ] User authentication
-- [ ] PDF generation for biodatas
-- [ ] Email notifications
-- [ ] Mobile-responsive improvements
-
-## License
-
-MIT
+Biodatas contain personal data. `backend/db/*.json` and `uploads/` are git-ignored; keep them out of version control, set `AUTH_USERNAME`/`AUTH_PASSWORD` before exposing the app beyond your machine, and serve it over HTTPS.

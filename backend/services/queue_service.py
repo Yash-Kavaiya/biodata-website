@@ -3,13 +3,18 @@ Queue Service - Advanced rate limiting, retry logic, and batch processing.
 Handles 100+ concurrent uploads with proper backpressure.
 """
 import asyncio
-import time
 import logging
+import random
+import time
 from typing import TypeVar, Callable, Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
@@ -22,6 +27,7 @@ class BatchStatus(str, Enum):
     COMPLETED = "completed"
     PARTIAL = "partial"  # Some succeeded, some failed
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -33,8 +39,9 @@ class BatchJob:
     successful: int = 0
     failed: int = 0
     status: BatchStatus = BatchStatus.PENDING
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     completed_at: Optional[datetime] = None
+    cancelled: bool = False
     errors: List[Dict[str, str]] = field(default_factory=list)
     results: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -57,6 +64,10 @@ class BatchJob:
         }
 
 
+class CircuitOpenError(Exception):
+    """Raised when the circuit breaker rejects a call."""
+
+
 class TokenBucket:
     """
     Token bucket rate limiter.
@@ -76,23 +87,16 @@ class TokenBucket:
 
     async def acquire(self, tokens: int = 1) -> float:
         """
-        Acquire tokens, waiting if necessary.
-        Returns wait time in seconds.
+        Reserve tokens and return how long the caller must wait before using them.
+        Tokens may go negative: each caller reserves its own slot, so concurrent
+        waiters are spread out instead of all firing when the bucket refills.
         """
         async with self._lock:
             now = time.monotonic()
-            elapsed = now - self.last_update
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.tokens = min(self.capacity, self.tokens + (now - self.last_update) * self.rate)
             self.last_update = now
-
-            if self.tokens >= tokens:
-                self.tokens -= tokens
-                return 0.0
-
-            # Calculate wait time
-            deficit = tokens - self.tokens
-            wait_time = deficit / self.rate
-            return wait_time
+            self.tokens -= tokens
+            return max(0.0, -self.tokens / self.rate)
 
 
 class CircuitBreaker:
@@ -206,11 +210,19 @@ class QueueService:
 
     def _is_retryable_error(self, error: Exception) -> bool:
         """Check if an error is retryable (rate limit, temporary failure)."""
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "code", None)
+        if isinstance(status, int):
+            return status in (408, 429, 500, 502, 503, 504, 529)
         error_str = str(error).lower()
         retryable_patterns = [
             "429",  # Rate limit
             "503",  # Service unavailable
             "502",  # Bad gateway
+            "529",  # Overloaded
+            "overloaded",
+            "unavailable",
             "resource_exhausted",
             "quota",
             "rate limit",
@@ -230,24 +242,23 @@ class QueueService:
         last_error = None
 
         for attempt in range(self.max_retries + 1):
+            if not await self.circuit_breaker.can_execute():
+                raise CircuitOpenError("OCR service temporarily unavailable (circuit breaker open)")
             try:
-                # Check circuit breaker
-                if not await self.circuit_breaker.can_execute():
-                    raise Exception("Circuit breaker is open - service temporarily unavailable")
-
-                # Execute function
                 result = await func(*args, **kwargs)
                 await self.circuit_breaker.record_success()
                 return result
 
             except Exception as e:
                 last_error = e
-                await self.circuit_breaker.record_failure()
 
-                # Don't retry non-retryable errors
+                # Bad input (corrupt file, invalid model) is not a provider outage:
+                # don't count it toward the circuit breaker and don't retry it.
                 if not self._is_retryable_error(e):
                     logger.error(f"Non-retryable error: {e}")
                     raise
+
+                await self.circuit_breaker.record_failure()
 
                 # Don't retry on last attempt
                 if attempt >= self.max_retries:
@@ -255,10 +266,7 @@ class QueueService:
                     raise
 
                 # Exponential backoff with jitter
-                delay = min(
-                    self.base_delay * (2 ** attempt) + (asyncio.get_event_loop().time() % 1),
-                    self.max_delay
-                )
+                delay = min(self.base_delay * (2 ** attempt) * random.uniform(1.0, 1.5), self.max_delay)
                 logger.warning(f"Retry {attempt + 1}/{self.max_retries} after {delay:.1f}s: {e}")
                 await asyncio.sleep(delay)
 
@@ -295,6 +303,7 @@ class QueueService:
 
     async def create_batch_job(self, total: int) -> BatchJob:
         """Create a new batch job for tracking."""
+        await self.cleanup_old_jobs()
         job = BatchJob(total=total, status=BatchStatus.PROCESSING)
         async with self._jobs_lock:
             self._batch_jobs[job.id] = job
@@ -329,8 +338,8 @@ class QueueService:
                     })
 
             # Update status on completion
-            if job.processed >= job.total:
-                job.completed_at = datetime.utcnow()
+            if job.processed >= job.total and not job.cancelled:
+                job.completed_at = _utcnow()
                 if job.failed == 0:
                     job.status = BatchStatus.COMPLETED
                 elif job.successful == 0:
@@ -338,66 +347,18 @@ class QueueService:
                 else:
                     job.status = BatchStatus.PARTIAL
 
-    async def process_batch(
-        self,
-        items: List[Any],
-        processor: Callable[[Any], Any],
-        chunk_size: int = 10,
-        job: Optional[BatchJob] = None
-    ) -> BatchJob:
-        """
-        Process items in batches with controlled concurrency.
-
-        Args:
-            items: List of items to process
-            processor: Async function to process each item
-            chunk_size: Number of items to process in parallel per chunk
-            job: Optional existing batch job for tracking
-
-        Returns:
-            BatchJob with results
-        """
-        if job is None:
-            job = await self.create_batch_job(len(items))
-
-        # Process in chunks to avoid overwhelming the system
-        for i in range(0, len(items), chunk_size):
-            chunk = items[i:i + chunk_size]
-
-            # Create tasks for this chunk
-            async def process_item(item):
-                try:
-                    result = await self.process_with_limit(processor, item)
-                    await self.update_batch_progress(
-                        job,
-                        success=True,
-                        result=result,
-                        filename=getattr(item, 'filename', None) or str(item)
-                    )
-                    return result
-                except Exception as e:
-                    await self.update_batch_progress(
-                        job,
-                        success=False,
-                        error=str(e),
-                        filename=getattr(item, 'filename', None) or str(item)
-                    )
-                    return None
-
-            # Execute chunk in parallel
-            tasks = [process_item(item) for item in chunk]
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-            # Small delay between chunks to prevent burst
-            if i + chunk_size < len(items):
-                await asyncio.sleep(0.1)
-
-        return job
+    async def cancel_batch_job(self, job: BatchJob):
+        """Stop scheduling further files for a job. In-flight OCR calls still finish."""
+        async with self._jobs_lock:
+            if job.status == BatchStatus.PROCESSING:
+                job.cancelled = True
+                job.status = BatchStatus.CANCELLED
+                job.completed_at = _utcnow()
 
     async def cleanup_old_jobs(self, max_age_hours: int = 24):
         """Remove old completed jobs to prevent memory leaks."""
         async with self._jobs_lock:
-            now = datetime.utcnow()
+            now = _utcnow()
             to_remove = []
             for job_id, job in self._batch_jobs.items():
                 if job.completed_at:

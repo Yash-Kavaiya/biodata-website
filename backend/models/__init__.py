@@ -8,12 +8,12 @@ from .biodata import (
     BiodataListResponse,
     UploadResponse,
     BulkUploadResponse,
-    OCRValidationRequest,
     SearchPreferences,
     MatchResult,
     Gender,
     MaritalStatus,
     OCRStatus,
+    utcnow,
 )
 
 __all__ = [
@@ -25,10 +25,10 @@ __all__ = [
     "BiodataListResponse",
     "UploadResponse",
     "BulkUploadResponse",
-    "OCRValidationRequest",
     "SearchPreferences",
     "MatchResult",
     "Gender",
     "MaritalStatus",
     "OCRStatus",
+    "utcnow",
 ]

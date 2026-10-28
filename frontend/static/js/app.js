@@ -1,881 +1,631 @@
 /**
  * Biodata Management System - AngularJS Application
- * Wedding Theme Edition
+ * Google Material Design 3 theme
  */
 
-// Create the AngularJS module
 var app = angular.module('biodataApp', []);
 
-// API Base URL
 var API_BASE = '/api';
+var ALLOWED_EXTENSIONS = ['pdf', 'png', 'jpg', 'jpeg'];
+var MULTIPART = { transformRequest: angular.identity, headers: { 'Content-Type': undefined } };
+
+// Every biodata field, in display order. `type` drives the edit form control.
+var BIODATA_FIELDS = [
+    { key: 'name', label: 'Name', section: 'Personal' },
+    { key: 'age', label: 'Age', type: 'number', section: 'Personal' },
+    { key: 'gender', label: 'Gender', type: 'select', options: ['male', 'female', 'other'], section: 'Personal' },
+    { key: 'date_of_birth', label: 'Date of Birth', section: 'Personal' },
+    { key: 'marital_status', label: 'Marital Status', type: 'select', options: ['single', 'married', 'divorced', 'widowed'], section: 'Personal' },
+    { key: 'height', label: 'Height', section: 'Personal' },
+    { key: 'weight', label: 'Weight', section: 'Personal' },
+    { key: 'complexion', label: 'Complexion', section: 'Personal' },
+    { key: 'blood_group', label: 'Blood Group', section: 'Personal' },
+    { key: 'education', label: 'Education', type: 'textarea', section: 'Career' },
+    { key: 'occupation', label: 'Occupation', section: 'Career' },
+    { key: 'company', label: 'Company', section: 'Career' },
+    { key: 'income', label: 'Income', section: 'Career' },
+    { key: 'father_name', label: 'Father Name', section: 'Family' },
+    { key: 'father_occupation', label: 'Father Occupation', section: 'Family' },
+    { key: 'mother_name', label: 'Mother Name', section: 'Family' },
+    { key: 'mother_occupation', label: 'Mother Occupation', section: 'Family' },
+    { key: 'siblings', label: 'Siblings', type: 'textarea', section: 'Family' },
+    { key: 'native_place', label: 'Native Place', section: 'Location' },
+    { key: 'current_city', label: 'Current City', section: 'Location' },
+    { key: 'state', label: 'State', section: 'Location' },
+    { key: 'country', label: 'Country', section: 'Location' },
+    { key: 'religion', label: 'Religion', section: 'Community' },
+    { key: 'caste', label: 'Caste', section: 'Community' },
+    { key: 'subcaste', label: 'Subcaste', section: 'Community' },
+    { key: 'gotra', label: 'Gotra', section: 'Community' },
+    { key: 'rashi', label: 'Rashi', section: 'Horoscope' },
+    { key: 'nakshatra', label: 'Nakshatra', section: 'Horoscope' },
+    { key: 'manglik', label: 'Manglik', section: 'Horoscope' },
+    { key: 'contact_number', label: 'Contact Number', section: 'Contact' },
+    { key: 'email', label: 'Email', type: 'email', section: 'Contact' },
+    { key: 'hobbies', label: 'Hobbies', type: 'textarea', section: 'About' },
+    { key: 'about', label: 'About', type: 'textarea', section: 'About' },
+    { key: 'partner_preferences', label: 'Partner Preferences', type: 'textarea', section: 'About' }
+];
+
+// Graph node colors come from the CSS data-viz tokens so light/dark stay in sync
+var GRAPH_COLOR_TOKENS = {
+    male: '--viz-1',
+    female: '--viz-2',
+    Religion: '--viz-3',
+    Location: '--viz-4',
+    Education: '--viz-5',
+    Occupation: '--viz-6',
+    Caste: '--md-sys-color-outline',
+    Person: '--md-sys-color-outline'
+};
+
+var STATUS_LABELS = {
+    completed: 'Needs review',
+    pending: 'Pending',
+    processing: 'Processing',
+    approved: 'Approved',
+    rejected: 'Rejected',
+    failed: 'Failed'
+};
+
+function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function apiError(error, fallback) {
+    var detail = error && error.data && error.data.detail;
+    if (angular.isArray(detail)) {
+        return detail.map(function (d) { return d.msg; }).join('; ');
+    }
+    return detail || fallback;
+}
+
+function extensionOf(name) {
+    return (name.split('.').pop() || '').toLowerCase();
+}
 
 // ==============================================
 // MAIN CONTROLLER
 // ==============================================
-app.controller('MainController', ['$scope', '$http', '$timeout', function ($scope, $http, $timeout) {
+app.controller('MainController', ['$scope', '$http', '$timeout', '$interval', '$q',
+    function ($scope, $http, $timeout, $interval, $q) {
 
     // ==================== STATE ====================
     $scope.currentPage = 'upload';
     $scope.isLoading = false;
     $scope.isDragOver = false;
+    $scope.appInfo = null;
+    $scope.counts = {};
 
-    // Models
     $scope.availableModels = [];
     $scope.selectedModel = null;
     $scope.defaultModel = null;
 
-    // Upload
+    $scope.uploadType = 'files';
     $scope.uploadQueue = [];
-    $scope.uploadType = 'files';  // 'files' or 'folder'
     $scope.batchJob = null;
-    $scope.batchPollInterval = null;
+    var batchPoll = null;
 
-    // Biodatas
-    $scope.biodatas = [];
-    $scope.totalBiodatas = 0;
+    $scope.list = { items: [], total: 0, page: 1, pages: 1, pageSize: 20, q: '', status: '' };
 
-    // Validation
     $scope.pendingValidation = [];
+    $scope.reviewLimit = 20;
     $scope.autoApproveConfidence = 0.35;
+    $scope.busy = {};  // biodata id -> true while an action is running
 
-    // Search
     $scope.searchTab = 'preferences';
     $scope.searchPrefs = {};
     $scope.searchResults = [];
+    $scope.searchTitle = 'Search Results';
     $scope.searchStats = null;
     $scope.isSearching = false;
     $scope.hasSearched = false;
+    $scope.searchFile = null;
 
-    // Graph
-    $scope.graphData = null;
     $scope.graphStats = null;
-    $scope.network = null;
+    $scope.graphEmpty = false;
+    var network = null;
 
-    // Modals
-    $scope.showBiodataModal = false;
-    $scope.showEditModal = false;
     $scope.selectedBiodata = null;
     $scope.editingBiodata = null;
-
-    // Toasts
     $scope.toasts = [];
 
-    // Field definitions
-    $scope.validationFields = [
-        { key: 'name', label: 'Name' },
-        { key: 'age', label: 'Age' },
-        { key: 'gender', label: 'Gender' },
-        { key: 'education', label: 'Education' },
-        { key: 'occupation', label: 'Occupation' },
-        { key: 'religion', label: 'Religion' },
-        { key: 'caste', label: 'Caste' },
-        { key: 'current_city', label: 'City' },
-        { key: 'state', label: 'State' },
-        { key: 'contact_number', label: 'Contact' }
+    $scope.navItems = [
+        { id: 'upload', label: 'Upload', icon: 'cloud_upload' },
+        { id: 'validation', label: 'Review', icon: 'fact_check' },
+        { id: 'biodatas', label: 'Profiles', icon: 'group' },
+        { id: 'search', label: 'Match', icon: 'favorite' },
+        { id: 'graph', label: 'Graph', icon: 'hub' }
     ];
 
-    $scope.editFields = [
-        { key: 'name', label: 'Name' },
-        { key: 'age', label: 'Age', type: 'number' },
-        { key: 'gender', label: 'Gender', type: 'select', options: ['male', 'female', 'other'] },
-        { key: 'education', label: 'Education' },
-        { key: 'occupation', label: 'Occupation' },
-        { key: 'religion', label: 'Religion' },
-        { key: 'caste', label: 'Caste' },
-        { key: 'current_city', label: 'Current City' },
-        { key: 'state', label: 'State' },
-        { key: 'contact_number', label: 'Contact' },
-        { key: 'email', label: 'Email', type: 'email' }
+    $scope.statusFilters = [
+        { value: '', label: 'All' },
+        { value: 'completed', label: 'Needs review' },
+        { value: 'approved', label: 'Approved' },
+        { value: 'rejected', label: 'Rejected' },
+        { value: 'failed', label: 'Failed' }
     ];
 
-    $scope.allFields = [
-        { key: 'name', label: 'Name' },
-        { key: 'age', label: 'Age' },
-        { key: 'gender', label: 'Gender' },
-        { key: 'date_of_birth', label: 'Date of Birth' },
-        { key: 'height', label: 'Height' },
-        { key: 'weight', label: 'Weight' },
-        { key: 'complexion', label: 'Complexion' },
-        { key: 'blood_group', label: 'Blood Group' },
-        { key: 'education', label: 'Education' },
-        { key: 'occupation', label: 'Occupation' },
-        { key: 'income', label: 'Income' },
-        { key: 'company', label: 'Company' },
-        { key: 'father_name', label: 'Father Name' },
-        { key: 'father_occupation', label: 'Father Occupation' },
-        { key: 'mother_name', label: 'Mother Name' },
-        { key: 'mother_occupation', label: 'Mother Occupation' },
-        { key: 'siblings', label: 'Siblings' },
-        { key: 'native_place', label: 'Native Place' },
-        { key: 'current_city', label: 'Current City' },
-        { key: 'state', label: 'State' },
-        { key: 'country', label: 'Country' },
-        { key: 'religion', label: 'Religion' },
-        { key: 'caste', label: 'Caste' },
-        { key: 'subcaste', label: 'Subcaste' },
-        { key: 'gotra', label: 'Gotra' },
-        { key: 'rashi', label: 'Rashi' },
-        { key: 'nakshatra', label: 'Nakshatra' },
-        { key: 'manglik', label: 'Manglik' },
-        { key: 'contact_number', label: 'Contact Number' },
-        { key: 'email', label: 'Email' },
-        { key: 'marital_status', label: 'Marital Status' },
-        { key: 'hobbies', label: 'Hobbies' },
-        { key: 'about', label: 'About' },
-        { key: 'partner_preferences', label: 'Partner Preferences' }
-    ];
+    $scope.fields = BIODATA_FIELDS;
+    $scope.summaryFields = BIODATA_FIELDS.filter(function (f) {
+        return ['name', 'age', 'gender', 'education', 'occupation', 'religion', 'caste',
+            'current_city', 'state', 'contact_number'].indexOf(f.key) !== -1;
+    });
+    $scope.fieldSections = BIODATA_FIELDS.reduce(function (sections, f) {
+        if (sections.indexOf(f.section) === -1) sections.push(f.section);
+        return sections;
+    }, []);
 
-    // ==================== INITIALIZATION ====================
+    // ==================== INIT & NAVIGATION ====================
     $scope.init = function () {
+        $http.get(API_BASE + '/info').then(function (r) { $scope.appInfo = r.data; });
         $scope.loadAvailableModels();
+        $scope.refreshCounts();
     };
 
-    // ==================== NAVIGATION ====================
     $scope.navigateTo = function (page) {
         $scope.currentPage = page;
-
+        window.scrollTo(0, 0);
         switch (page) {
-            case 'validation':
-                $scope.loadPendingValidation();
-                break;
-            case 'biodatas':
-                $scope.loadBiodatas();
-                break;
-            case 'search':
-                $scope.loadSearchStats();
-                break;
-            case 'graph':
-                $scope.loadGraphData();
-                break;
+            case 'validation': $scope.loadPendingValidation(); break;
+            case 'biodatas': $scope.loadBiodatas(); break;
+            case 'search': $scope.loadSearchStats(); break;
+            case 'graph': $scope.loadGraph(); break;
         }
     };
 
-    // ==================== TOAST ====================
-    $scope.showToast = function (message, type) {
-        type = type || 'success';
-        var toast = { message: message, type: type };
-        $scope.toasts.push(toast);
+    $scope.refreshCounts = function () {
+        $http.get(API_BASE + '/biodata/stats').then(function (r) { $scope.counts = r.data; });
+    };
 
+    $scope.pendingCount = function () {
+        return ($scope.counts.completed || 0) + ($scope.counts.pending || 0) + ($scope.counts.failed || 0);
+    };
+
+    // ==================== TOASTS ====================
+    $scope.showToast = function (message, type) {
+        var toast = { message: message, type: type || 'success' };
+        $scope.toasts.push(toast);
         $timeout(function () {
-            var index = $scope.toasts.indexOf(toast);
-            if (index > -1) {
-                $scope.toasts.splice(index, 1);
-            }
-        }, 3000);
+            var i = $scope.toasts.indexOf(toast);
+            if (i > -1) $scope.toasts.splice(i, 1);
+        }, type === 'error' ? 6000 : 3000);
     };
 
     // ==================== MODELS ====================
     $scope.loadAvailableModels = function () {
-        $http.get(API_BASE + '/upload/models')
-            .then(function (response) {
-                $scope.availableModels = response.data.models;
-                $scope.defaultModel = response.data.default;
-                $scope.selectedModel = response.data.default;
-            })
-            .catch(function (error) {
-                console.error('Failed to load models:', error);
-                $scope.availableModels = [
-                    'gemini-2.0-flash-001',
-                    'gemini-2.0-flash-lite-001',
-                    'gemini-2.5-pro-preview-06-05',
-                    'gemini-2.5-flash-preview-05-20'
-                ];
-                $scope.selectedModel = 'gemini-2.0-flash-001';
-                $scope.defaultModel = 'gemini-2.0-flash-001';
-            });
+        $http.get(API_BASE + '/upload/models').then(function (r) {
+            $scope.availableModels = r.data.models || [];
+            $scope.defaultModel = r.data.default;
+            $scope.selectedModel = r.data.default;
+            $scope.ocrProvider = r.data.provider;
+        });
     };
+
+    function modelQuery(prefix) {
+        var usable = $scope.selectedModel && $scope.availableModels.indexOf($scope.selectedModel) !== -1;
+        return usable ? prefix + 'model=' + encodeURIComponent($scope.selectedModel) : '';
+    }
 
     // ==================== UPLOAD ====================
-    $scope.triggerFileInput = function () {
-        document.getElementById('fileInput').click();
+    $scope.triggerInput = function (id) {
+        document.getElementById(id).click();
     };
 
-    $scope.handleDragOver = function (event) {
-        event.preventDefault();
-        $scope.isDragOver = true;
-    };
-
+    $scope.handleDragOver = function () { $scope.isDragOver = true; };
+    $scope.handleDragLeave = function () { $scope.isDragOver = false; };
     $scope.handleDrop = function (event) {
-        event.preventDefault();
         $scope.isDragOver = false;
-        var files = event.dataTransfer ? event.dataTransfer.files : [];
-        $scope.processFiles(files);
+        var dt = event.dataTransfer || (event.originalEvent && event.originalEvent.dataTransfer);
+        $scope.addFiles(dt ? dt.files : []);
     };
 
-    $scope.handleFileSelect = function (files) {
-        $scope.$apply(function () {
-            $scope.processFiles(files);
-        });
-    };
-
-    $scope.processFiles = function (files) {
-        var validFiles = [];
-        for (var i = 0; i < files.length; i++) {
-            var file = files[i];
-            var ext = file.name.split('.').pop().toLowerCase();
-            if (['pdf', 'png', 'jpg', 'jpeg'].indexOf(ext) !== -1) {
-                validFiles.push(file);
-            }
-        }
-
-        if (validFiles.length === 0) {
-            $scope.showToast('No valid files selected. Allowed: PDF, PNG, JPG', 'error');
-            return;
-        }
-
-        // Add to queue
-        validFiles.forEach(function (file) {
-            $scope.uploadQueue.push({
-                id: Date.now() + Math.random().toString(36).substr(2, 9),
-                file: file,
-                name: file.name,
-                status: 'pending',
-                message: ''
-            });
-        });
-
-        // Process uploads
-        if (validFiles.length === 1) {
-            $scope.uploadSingleFile($scope.uploadQueue[$scope.uploadQueue.length - 1]);
-        } else {
-            $scope.uploadBulkFiles(validFiles);
-        }
-    };
-
-    $scope.uploadSingleFile = function (queueItem) {
-        queueItem.status = 'uploading';
-
-        var formData = new FormData();
-        formData.append('file', queueItem.file);
-
-        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
-
-        $http.post(API_BASE + '/upload/single' + modelParam, formData, {
-            transformRequest: angular.identity,
-            headers: { 'Content-Type': undefined }
-        }).then(function (response) {
-            queueItem.status = 'completed';
-            queueItem.message = response.data.message;
-            $scope.showToast(queueItem.name + ' uploaded successfully!', 'success');
-        }).catch(function (error) {
-            queueItem.status = 'failed';
-            queueItem.error = error.data ? error.data.detail : 'Upload failed';
-            $scope.showToast('Failed to upload ' + queueItem.name, 'error');
-        });
-    };
-
-    $scope.uploadBulkFiles = function (files) {
-        var formData = new FormData();
-        files.forEach(function (file) {
-            formData.append('files', file);
-        });
-
-        $scope.uploadQueue.forEach(function (item) {
-            if (item.status === 'pending') {
-                item.status = 'uploading';
-            }
-        });
-
-        // Use async bulk endpoint for large batches (> 20 files)
-        var endpoint = files.length > 20 ? '/upload/async/bulk' : '/upload/bulk';
-        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
-
-        $http.post(API_BASE + endpoint + modelParam, formData, {
-            transformRequest: angular.identity,
-            headers: { 'Content-Type': undefined }
-        }).then(function (response) {
-            var result = response.data;
-
-            // Check if async response (has job_id)
-            if (result.job_id) {
-                $scope.showToast('Batch upload started: ' + result.queued + ' files queued', 'success');
-                $scope.startBatchPolling(result.job_id);
-                return;
-            }
-
-            // Sync response
-            result.uploads.forEach(function (upload) {
-                var queueItem = $scope.uploadQueue.find(function (q) {
-                    return q.name === upload.filename;
-                });
-                if (queueItem) {
-                    queueItem.status = upload.status === 'failed' ? 'failed' : 'completed';
-                    queueItem.message = upload.message;
-                }
-            });
-            $scope.showToast('Uploaded ' + result.successful + '/' + result.total + ' files',
-                result.failed > 0 ? 'error' : 'success');
-        }).catch(function (error) {
-            $scope.uploadQueue.forEach(function (item) {
-                if (item.status === 'uploading') {
-                    item.status = 'failed';
-                    item.error = 'Upload failed';
-                }
-            });
-            $scope.showToast('Bulk upload failed: ' + (error.data ? error.data.detail : 'Unknown error'), 'error');
-        });
-    };
-
-    // ==================== FOLDER UPLOAD ====================
-    $scope.triggerFolderInput = function () {
-        document.getElementById('folderInput').click();
-    };
-
-    $scope.handleFolderSelect = function (files) {
-        $scope.$apply(function () {
-            $scope.processFolderFiles(files);
-        });
-    };
-
-    $scope.processFolderFiles = function (files) {
-        var validFiles = [];
-        var skippedCount = 0;
-
-        for (var i = 0; i < files.length; i++) {
-            var file = files[i];
-            var ext = file.name.split('.').pop().toLowerCase();
-
-            // Skip hidden files and non-supported formats
-            if (file.name.startsWith('.')) {
-                skippedCount++;
-                continue;
-            }
-
-            if (['pdf', 'png', 'jpg', 'jpeg'].indexOf(ext) !== -1) {
-                validFiles.push(file);
+    $scope.addFiles = function (fileList) {
+        var files = [], skipped = 0;
+        angular.forEach(fileList, function (file) {
+            if (file.name.charAt(0) !== '.' && ALLOWED_EXTENSIONS.indexOf(extensionOf(file.name)) !== -1) {
+                files.push(file);
             } else {
-                skippedCount++;
+                skipped++;
             }
-        }
-
-        if (validFiles.length === 0) {
-            $scope.showToast('No valid files found in folder. Supported: PDF, PNG, JPG', 'error');
-            return;
-        }
-
-        if (validFiles.length > 200) {
-            $scope.showToast('Too many files (' + validFiles.length + '). Maximum 200 files allowed.', 'error');
-            return;
-        }
-
-        $scope.showToast('Found ' + validFiles.length + ' valid files' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped)' : ''), 'success');
-
-        // Clear old queue
-        $scope.uploadQueue = [];
-
-        // Add to queue
-        validFiles.forEach(function (file) {
-            $scope.uploadQueue.push({
-                id: Date.now() + Math.random().toString(36).substr(2, 9),
-                file: file,
-                name: file.webkitRelativePath || file.name,
-                status: 'pending',
-                message: ''
-            });
         });
 
-        // Upload using async bulk endpoint
-        $scope.uploadFolderAsync(validFiles);
+        if (!files.length) {
+            $scope.showToast('No supported files found. Allowed: PDF, PNG, JPG', 'error');
+            return;
+        }
+        var maxFiles = ($scope.appInfo && $scope.appInfo.max_bulk_files) || 200;
+        if (files.length > maxFiles) {
+            $scope.showToast('Too many files (' + files.length + '). Maximum is ' + maxFiles + '.', 'error');
+            return;
+        }
+        if (skipped) {
+            $scope.showToast(skipped + ' unsupported file(s) skipped', 'error');
+        }
+
+        $scope.uploadQueue = files.map(function (file) {
+            return { file: file, name: file.name, path: file.webkitRelativePath || file.name, status: 'uploading', message: '' };
+        });
+
+        if (files.length === 1) {
+            uploadSingle($scope.uploadQueue[0]);
+        } else {
+            uploadBatch($scope.uploadQueue);
+        }
     };
 
-    $scope.uploadFolderAsync = function (files) {
-        var formData = new FormData();
-        files.forEach(function (file) {
-            formData.append('files', file);
-        });
-
-        $scope.uploadQueue.forEach(function (item) {
-            item.status = 'uploading';
-        });
-
-        var modelParam = $scope.selectedModel ? '?model=' + encodeURIComponent($scope.selectedModel) : '';
-
-        $http.post(API_BASE + '/upload/async/bulk' + modelParam, formData, {
-            transformRequest: angular.identity,
-            headers: { 'Content-Type': undefined }
-        }).then(function (response) {
-            var result = response.data;
-            $scope.showToast('Folder upload started: ' + result.queued + ' files queued for processing', 'success');
-
-            // Show validation errors immediately
-            if (result.validation_errors > 0) {
-                $scope.showToast(result.validation_errors + ' files failed validation', 'error');
-            }
-
-            // Start polling for progress
-            $scope.startBatchPolling(result.job_id);
+    function uploadSingle(item) {
+        var form = new FormData();
+        form.append('file', item.file);
+        $http.post(API_BASE + '/upload/single' + modelQuery('?'), form, MULTIPART).then(function (r) {
+            item.status = 'completed';
+            item.message = r.data.message;
+            item.id = r.data.id;
+            $scope.showToast(item.name + ' processed. Review it on the Validation page.', 'success');
+            $scope.refreshCounts();
         }).catch(function (error) {
-            $scope.uploadQueue.forEach(function (item) {
+            item.status = 'failed';
+            item.message = apiError(error, 'Upload failed');
+            $scope.showToast('Failed: ' + item.name, 'error');
+        });
+    }
+
+    function uploadBatch(items) {
+        var form = new FormData();
+        items.forEach(function (item) { form.append('files', item.file); });
+
+        $http.post(API_BASE + '/upload/async/bulk' + modelQuery('?'), form, MULTIPART).then(function (r) {
+            items.forEach(function (item) { item.status = 'processing'; });
+            $scope.showToast(r.data.queued + ' file(s) queued for OCR', 'success');
+            startBatchPolling(r.data.job_id, items.length);
+        }).catch(function (error) {
+            items.forEach(function (item) {
                 item.status = 'failed';
-                item.error = 'Upload failed';
+                item.message = apiError(error, 'Upload failed');
             });
-            $scope.showToast('Folder upload failed: ' + (error.data ? error.data.detail : 'Unknown error'), 'error');
+            $scope.showToast('Upload failed: ' + apiError(error, 'unknown error'), 'error');
+        });
+    }
+
+    function startBatchPolling(jobId, total) {
+        stopBatchPolling();
+        $scope.batchJob = { id: jobId, status: 'processing', total: total, processed: 0, successful: 0, failed: 0, progress_percent: 0 };
+        pollBatch(jobId);
+        batchPoll = $interval(function () { pollBatch(jobId); }, 2000);
+    }
+
+    function stopBatchPolling() {
+        if (batchPoll) {
+            $interval.cancel(batchPoll);
+            batchPoll = null;
+        }
+    }
+
+    function pollBatch(jobId) {
+        $http.get(API_BASE + '/upload/batch/' + jobId + '/status').then(function (r) {
+            $scope.batchJob = r.data;
+            if (r.data.status === 'processing') return;
+            stopBatchPolling();
+            $http.get(API_BASE + '/upload/batch/' + jobId + '/results').then(function (res) {
+                applyBatchResults(res.data);
+            });
+        });
+    }
+
+    function applyBatchResults(job) {
+        var byName = {};
+        (job.results || []).forEach(function (r) { byName[r.filename] = { status: 'completed', message: r.message }; });
+        (job.errors || []).forEach(function (e) { byName[e.filename] = { status: 'failed', message: e.error }; });
+        $scope.uploadQueue.forEach(function (item) {
+            var outcome = byName[item.name];
+            if (outcome) {
+                item.status = outcome.status;
+                item.message = outcome.message;
+            } else if (item.status === 'processing') {
+                item.status = job.status === 'cancelled' ? 'cancelled' : 'failed';
+            }
+        });
+        var type = job.failed ? 'error' : 'success';
+        $scope.showToast('Batch ' + job.status + ': ' + job.successful + ' succeeded, ' + job.failed + ' failed', type);
+        $scope.refreshCounts();
+    }
+
+    $scope.cancelBatch = function () {
+        if (!$scope.batchJob) return;
+        $http.delete(API_BASE + '/upload/batch/' + $scope.batchJob.id).then(function () {
+            $scope.showToast('Batch cancelled. Files already sent to OCR will still finish.', 'success');
         });
     };
 
-    // ==================== BATCH PROGRESS POLLING ====================
-    $scope.startBatchPolling = function (jobId) {
-        // Clear any existing poll
-        if ($scope.batchPollInterval) {
-            clearInterval($scope.batchPollInterval);
-        }
-
-        $scope.batchJob = {
-            id: jobId,
-            status: 'processing',
-            total: $scope.uploadQueue.length,
-            processed: 0,
-            successful: 0,
-            failed: 0,
-            progress_percent: 0,
-            errors: []
-        };
-
-        // Poll every 2 seconds
-        $scope.batchPollInterval = setInterval(function () {
-            $scope.pollBatchStatus(jobId);
-        }, 2000);
-
-        // Initial poll
-        $scope.pollBatchStatus(jobId);
+    $scope.hasActiveUploads = function () {
+        return $scope.uploadQueue.some(function (item) {
+            return item.status === 'uploading' || item.status === 'processing';
+        });
     };
 
-    $scope.pollBatchStatus = function (jobId) {
-        $http.get(API_BASE + '/upload/batch/' + jobId + '/status')
-            .then(function (response) {
-                $scope.batchJob = response.data;
-
-                // Update upload queue items based on progress
-                var processedCount = response.data.processed;
-                $scope.uploadQueue.forEach(function (item, index) {
-                    if (index < processedCount) {
-                        item.status = 'completed';
-                    }
-                });
-
-                // Check if complete
-                if (response.data.status !== 'processing') {
-                    $scope.stopBatchPolling();
-
-                    if (response.data.status === 'completed') {
-                        $scope.showToast('All ' + response.data.successful + ' files processed successfully!', 'success');
-                    } else if (response.data.status === 'partial') {
-                        $scope.showToast('Batch completed: ' + response.data.successful + ' success, ' + response.data.failed + ' failed', 'error');
-                    } else if (response.data.status === 'failed') {
-                        $scope.showToast('Batch failed: ' + response.data.failed + ' files failed', 'error');
-                    }
-
-                    // Mark failed items in queue
-                    if (response.data.errors && response.data.errors.length > 0) {
-                        response.data.errors.forEach(function (err) {
-                            var queueItem = $scope.uploadQueue.find(function (q) {
-                                return q.name.endsWith(err.filename) || q.name === err.filename;
-                            });
-                            if (queueItem) {
-                                queueItem.status = 'failed';
-                                queueItem.error = err.error;
-                            }
-                        });
-                    }
-                }
-            })
-            .catch(function (error) {
-                console.error('Failed to poll batch status:', error);
-                // Don't stop polling on transient errors
-            });
+    $scope.clearQueue = function () {
+        stopBatchPolling();
+        $scope.uploadQueue = [];
+        $scope.batchJob = null;
     };
 
-    $scope.stopBatchPolling = function () {
-        if ($scope.batchPollInterval) {
-            clearInterval($scope.batchPollInterval);
-            $scope.batchPollInterval = null;
-        }
-    };
+    $scope.$on('$destroy', stopBatchPolling);
 
-    // ==================== BIODATAS ====================
-    $scope.loadBiodatas = function () {
+    // ==================== ALL BIODATAS ====================
+    $scope.loadBiodatas = function (page) {
+        var list = $scope.list;
+        if (page) list.page = page;
         $scope.isLoading = true;
+        var params = { page: list.page, page_size: list.pageSize };
+        if (list.q) params.q = list.q;
+        if (list.status) params.status = list.status;
 
-        $http.get(API_BASE + '/biodata?page=1&page_size=20')
-            .then(function (response) {
-                $scope.biodatas = response.data.items;
-                $scope.totalBiodatas = response.data.total;
-                $scope.isLoading = false;
-            })
-            .catch(function (error) {
-                $scope.isLoading = false;
-                $scope.showToast('Failed to load biodatas', 'error');
-            });
+        $http.get(API_BASE + '/biodata', { params: params }).then(function (r) {
+            list.items = r.data.items;
+            list.total = r.data.total;
+            list.pages = r.data.pages;
+            if (list.page > list.pages) $scope.loadBiodatas(list.pages);
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Failed to load biodatas'), 'error');
+        }).finally(function () {
+            $scope.isLoading = false;
+        });
+    };
+
+    $scope.setStatusFilter = function (status) {
+        $scope.list.status = status;
+        $scope.loadBiodatas(1);
+    };
+
+    $scope.globalSearch = function () {
+        $scope.list.status = '';
+        $scope.list.page = 1;
+        $scope.navigateTo('biodatas');
+    };
+
+    $scope.clearGlobalSearch = function () {
+        $scope.list.q = '';
+        if ($scope.currentPage === 'biodatas') $scope.loadBiodatas(1);
     };
 
     $scope.viewBiodata = function (id) {
-        $http.get(API_BASE + '/biodata/' + id)
-            .then(function (response) {
-                $scope.selectedBiodata = response.data;
-                $scope.showBiodataModal = true;
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to load biodata details', 'error');
-            });
+        $http.get(API_BASE + '/biodata/' + id).then(function (r) {
+            $scope.selectedBiodata = r.data;
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Failed to load biodata'), 'error');
+        });
     };
 
-    $scope.deleteBiodata = function (id) {
-        if (!confirm('Are you sure you want to delete this biodata?')) return;
-
-        $http.delete(API_BASE + '/biodata/' + id)
-            .then(function (response) {
-                $scope.showToast('Biodata deleted successfully', 'success');
-                $scope.loadBiodatas();
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to delete biodata', 'error');
-            });
+    $scope.closeModals = function () {
+        $scope.selectedBiodata = null;
+        $scope.editingBiodata = null;
     };
 
-    $scope.closeBiodataModal = function (event) {
-        if (event.target === event.currentTarget) {
-            $scope.showBiodataModal = false;
-        }
+    $scope.deleteBiodata = function (biodata) {
+        if (!confirm('Permanently delete the biodata for ' + (biodata.name || 'this person') + '?')) return;
+        $http.delete(API_BASE + '/biodata/' + biodata.id).then(function () {
+            $scope.showToast('Biodata deleted', 'success');
+            $scope.closeModals();
+            $scope.refreshCounts();
+            if ($scope.currentPage === 'biodatas') $scope.loadBiodatas();
+            if ($scope.currentPage === 'validation') $scope.loadPendingValidation();
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Failed to delete biodata'), 'error');
+        });
     };
 
     // ==================== VALIDATION ====================
+    $scope.showMoreReviews = function () {
+        $scope.reviewLimit += 20;
+    };
+
     $scope.loadPendingValidation = function () {
         $scope.isLoading = true;
-
-        $http.get(API_BASE + '/biodata/pending')
-            .then(function (response) {
-                $scope.pendingValidation = response.data.items;
-                $scope.isLoading = false;
-            })
-            .catch(function (error) {
-                $scope.isLoading = false;
-                $scope.showToast('Failed to load pending validations', 'error');
-            });
+        $http.get(API_BASE + '/biodata/pending').then(function (r) {
+            $scope.pendingValidation = r.data.items;
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Failed to load pending validations'), 'error');
+        }).finally(function () {
+            $scope.isLoading = false;
+        });
     };
 
-    $scope.approveValidation = function (id) {
-        $http.post(API_BASE + '/validation/approve/' + id)
-            .then(function (response) {
-                $scope.showToast('Biodata approved successfully', 'success');
-                $scope.loadPendingValidation();
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to approve biodata', 'error');
-            });
+    function runAction(biodata, request, successMessage) {
+        $scope.busy[biodata.id] = true;
+        return request.then(function (r) {
+            $scope.showToast(successMessage, 'success');
+            $scope.refreshCounts();
+            if ($scope.currentPage === 'validation') $scope.loadPendingValidation();
+            if ($scope.currentPage === 'biodatas') $scope.loadBiodatas();
+            return r;
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Action failed'), 'error');
+            if ($scope.currentPage === 'validation') $scope.loadPendingValidation();
+            return $q.reject(error);
+        }).finally(function () {
+            delete $scope.busy[biodata.id];
+        });
+    }
+
+    $scope.approve = function (biodata) {
+        runAction(biodata, $http.post(API_BASE + '/validation/approve/' + biodata.id), 'Approved ' + (biodata.name || 'biodata'));
     };
 
-    $scope.rejectValidation = function (id) {
-        if (!confirm('Are you sure you want to reject this biodata?')) return;
-
-        $http.post(API_BASE + '/validation/reject/' + id)
-            .then(function (response) {
-                $scope.showToast('Biodata rejected', 'success');
-                $scope.loadPendingValidation();
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to reject biodata', 'error');
-            });
+    $scope.reject = function (biodata) {
+        if (!confirm('Reject this biodata? It will be excluded from matching.')) return;
+        runAction(biodata, $http.post(API_BASE + '/validation/reject/' + biodata.id), 'Biodata rejected');
     };
 
-    $scope.rerunOCR = function (id) {
-        $scope.showToast('Re-running OCR...', 'success');
-
-        $http.post(API_BASE + '/validation/re-ocr/' + id)
-            .then(function (response) {
-                $scope.showToast('OCR re-processed successfully', 'success');
-                $scope.loadPendingValidation();
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to re-run OCR', 'error');
-            });
+    $scope.rerunOCR = function (biodata) {
+        runAction(biodata, $http.post(API_BASE + '/validation/re-ocr/' + biodata.id + modelQuery('?')), 'OCR re-processed');
     };
 
-    $scope.editValidation = function (biodata) {
+    $scope.editBiodata = function (biodata) {
+        $scope.selectedBiodata = null;
         $scope.editingBiodata = angular.copy(biodata);
-        $scope.showEditModal = true;
-    };
-
-    $scope.closeEditModal = function (event) {
-        if (event.target === event.currentTarget) {
-            $scope.showEditModal = false;
-        }
     };
 
     $scope.saveEditAndApprove = function () {
-        if (!$scope.editingBiodata) return;
-
-        $http.put(API_BASE + '/biodata/' + $scope.editingBiodata.id, $scope.editingBiodata)
-            .then(function (response) {
-                return $http.post(API_BASE + '/validation/approve/' + $scope.editingBiodata.id);
-            })
-            .then(function (response) {
-                $scope.showToast('Biodata saved and approved', 'success');
-                $scope.showEditModal = false;
-                $scope.loadPendingValidation();
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to save biodata', 'error');
-            });
+        var biodata = $scope.editingBiodata;
+        var payload = {};
+        BIODATA_FIELDS.forEach(function (f) {
+            var value = biodata[f.key];
+            if (typeof value === 'string') value = value.trim();
+            payload[f.key] = (value === '' || value === undefined) ? null : value;
+        });
+        runAction(biodata, $http.post(API_BASE + '/validation/edit/' + biodata.id, payload), 'Saved and approved')
+            .then(function () { $scope.editingBiodata = null; });
     };
 
     $scope.autoApproveAll = function () {
-        var confidence = $scope.autoApproveConfidence || 0.35;
-
-        $http.post(API_BASE + '/validation/auto-approve-all?min_confidence=' + confidence)
-            .then(function (response) {
-                $scope.showToast('Auto-approved ' + response.data.approved_count + ' biodatas', 'success');
-                $scope.loadPendingValidation();
-            })
-            .catch(function (error) {
-                $scope.showToast('Error during auto-approve', 'error');
-            });
+        var threshold = parseFloat($scope.autoApproveConfidence);
+        if (isNaN(threshold) || threshold < 0 || threshold > 1) {
+            $scope.showToast('Confidence threshold must be between 0 and 1', 'error');
+            return;
+        }
+        if (!confirm('Approve every pending biodata with at least ' + Math.round(threshold * 100) + '% confidence?')) return;
+        $http.post(API_BASE + '/validation/auto-approve-all', null, { params: { min_confidence: threshold } }).then(function (r) {
+            $scope.showToast('Auto-approved ' + r.data.approved_count + ' biodata(s)', 'success');
+            $scope.refreshCounts();
+            $scope.loadPendingValidation();
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Auto-approve failed'), 'error');
+        });
     };
 
     // ==================== SEARCH ====================
     $scope.loadSearchStats = function () {
-        $http.get(API_BASE + '/search/stats')
-            .then(function (response) {
-                $scope.searchStats = response.data;
-            })
-            .catch(function (error) {
-                console.error('Failed to load search stats', error);
-            });
+        $http.get(API_BASE + '/search/stats').then(function (r) { $scope.searchStats = r.data; });
     };
 
-    $scope.performSearch = function () {
+    function runSearch(request, title) {
         $scope.isSearching = true;
         $scope.hasSearched = true;
+        $scope.searchTitle = title;
+        $scope.searchResults = [];
+        request.then(function (r) {
+            $scope.searchResults = r.data;
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Search failed'), 'error');
+        }).finally(function () {
+            $scope.isSearching = false;
+        });
+    }
 
-        var preferences = {};
-        if ($scope.searchPrefs.gender) preferences.gender = $scope.searchPrefs.gender;
-        if ($scope.searchPrefs.min_age) preferences.min_age = parseInt($scope.searchPrefs.min_age);
-        if ($scope.searchPrefs.max_age) preferences.max_age = parseInt($scope.searchPrefs.max_age);
-        if ($scope.searchPrefs.religion) preferences.religion = $scope.searchPrefs.religion;
-        if ($scope.searchPrefs.caste) preferences.caste = $scope.searchPrefs.caste;
-        if ($scope.searchPrefs.education) preferences.education = $scope.searchPrefs.education;
-        if ($scope.searchPrefs.location) preferences.location = $scope.searchPrefs.location;
+    $scope.performSearch = function () {
+        var prefs = {};
+        angular.forEach($scope.searchPrefs, function (value, key) {
+            if (value !== null && value !== undefined && value !== '') prefs[key] = value;
+        });
+        if (!Object.keys(prefs).length) {
+            $scope.showToast('Enter at least one search criterion', 'error');
+            return;
+        }
+        runSearch($http.post(API_BASE + '/search/preferences', prefs, { params: { limit: 20 } }), 'Search Results');
+    };
 
-        $http.post(API_BASE + '/search/preferences?limit=20', preferences)
-            .then(function (response) {
-                $scope.searchResults = response.data;
-                $scope.isSearching = false;
-            })
-            .catch(function (error) {
-                $scope.isSearching = false;
-                $scope.showToast('Search failed', 'error');
-            });
+    $scope.resetSearch = function () {
+        $scope.searchPrefs = {};
+        $scope.searchResults = [];
+        $scope.hasSearched = false;
+    };
+
+    $scope.setSearchFile = function (files) {
+        $scope.searchFile = files && files.length ? files[0] : null;
     };
 
     $scope.searchByUpload = function () {
-        var fileInput = document.getElementById('searchFileInput');
-        if (!fileInput || !fileInput.files.length) {
+        if (!$scope.searchFile) {
             $scope.showToast('Please select a file first', 'error');
             return;
         }
-
-        $scope.isSearching = true;
-        $scope.hasSearched = true;
-
-        var formData = new FormData();
-        formData.append('file', fileInput.files[0]);
-
-        $http.post(API_BASE + '/search/by-upload?limit=20', formData, {
-            transformRequest: angular.identity,
-            headers: { 'Content-Type': undefined }
-        }).then(function (response) {
-            $scope.searchResults = response.data;
-            $scope.isSearching = false;
-        }).catch(function (error) {
-            $scope.isSearching = false;
-            $scope.showToast('Search failed', 'error');
-        });
+        var form = new FormData();
+        form.append('file', $scope.searchFile);
+        runSearch($http.post(API_BASE + '/search/by-upload?limit=20', form, MULTIPART),
+            'Matches for ' + $scope.searchFile.name);
     };
 
-    $scope.loadGraphData = function () {
-        $http.get(API_BASE + '/search/graph?limit=100')
-            .then(function (response) {
-                $scope.graphData = response.data;
-                $scope.renderGraph();
-                $scope.showToast('Graph loaded successfully', 'success');
-            })
-            .catch(function (error) {
-                $scope.showToast('Failed to load graph data', 'error');
-            });
-    };
-
-    $scope.loadGraphStats = function () {
-        // Note: This would need a separate endpoint for stats, but for now we'll use graph data
-        $scope.showToast('Stats feature coming soon', 'info');
-    };
-
-    $scope.renderGraph = function () {
-        if (!$scope.graphData || !$scope.graphData.nodes || $scope.graphData.nodes.length === 0) {
-            return;
-        }
-
-        var container = document.getElementById('graphContainer');
-
-        // Prepare nodes for Vis.js
-        var nodes = $scope.graphData.nodes.map(function (node) {
-            var color = '#97c2fc'; // default blue
-            if (node.type === 'Person') {
-                color = node.group === 'male' ? '#7be141' : '#e7717d'; // green for male, pink for female
-            } else if (node.type === 'Religion') {
-                color = '#ffa500'; // orange
-            } else if (node.type === 'Caste') {
-                color = '#ff6b6b'; // red
-            } else if (node.type === 'Location') {
-                color = '#4ecdc4'; // teal
-            } else if (node.type === 'Education') {
-                color = '#45b7d1'; // blue
-            } else if (node.type === 'Occupation') {
-                color = '#96ceb4'; // green
-            }
-
-            return {
-                id: node.id,
-                label: node.label || node.id,
-                color: color,
-                title: node.title || node.label,
-                group: node.type
-            };
-        });
-
-        // Prepare edges
-        var edges = ($scope.graphData.edges || []).map(function (edge) {
-            return {
-                from: edge.source,
-                to: edge.target,
-                label: edge.type,
-                arrows: 'to'
-            };
-        });
-
-        var data = {
-            nodes: new vis.DataSet(nodes),
-            edges: new vis.DataSet(edges)
-        };
-
-        var options = {
-            nodes: {
-                shape: 'dot',
-                size: 16,
-                font: {
-                    size: 12,
-                    color: '#333'
-                },
-                borderWidth: 2
-            },
-            edges: {
-                width: 2,
-                font: {
-                    size: 10,
-                    align: 'middle'
-                }
-            },
-            physics: {
-                stabilization: false,
-                barnesHut: {
-                    gravitationalConstant: -80000,
-                    springConstant: 0.001,
-                    springLength: 200
-                }
-            },
-            interaction: {
-                hover: true,
-                tooltipDelay: 200
-            }
-        };
-
-        if ($scope.network) {
-            $scope.network.destroy();
-        }
-
-        $scope.network = new vis.Network(container, data, options);
+    $scope.findMatchesFor = function (biodata) {
+        $scope.closeModals();
+        $scope.navigateTo('search');
+        runSearch($http.post(API_BASE + '/search/by-biodata/' + biodata.id, null, { params: { limit: 20 } }),
+            'Matches for ' + (biodata.name || 'selected profile'));
     };
 
     // ==================== GRAPH ====================
-    $scope.loadGraphData = function () {
+    $scope.loadGraph = function () {
         $scope.isLoading = true;
-        $http.get(API_BASE + '/search/graph')
-            .then(function (response) {
-                $scope.isLoading = false;
-                $scope.renderGraph(response.data);
-            })
-            .catch(function (error) {
-                $scope.isLoading = false;
-                $scope.showToast('Failed to load graph data', 'error');
-                console.error(error);
-            });
+        $http.get(API_BASE + '/graph/stats').then(function (r) { $scope.graphStats = r.data; });
+        $http.get(API_BASE + '/graph/data', { params: { limit: 100 } }).then(function (r) {
+            $scope.graphEmpty = !r.data.nodes.length;
+            // Render after Angular has shown the container
+            $timeout(function () { renderGraph(r.data); });
+        }).catch(function (error) {
+            $scope.showToast(apiError(error, 'Failed to load graph'), 'error');
+        }).finally(function () {
+            $scope.isLoading = false;
+        });
     };
 
-    $scope.renderGraph = function (data) {
-        var container = document.getElementById('network-container');
+    function renderGraph(data) {
+        if (network) {
+            network.destroy();
+            network = null;
+        }
+        if (!data.nodes.length || typeof vis === 'undefined') return;
+
+        var colorFor = function (key) { return cssVar(GRAPH_COLOR_TOKENS[key] || GRAPH_COLOR_TOKENS.Person); };
+        var textColor = cssVar('--md-sys-color-on-surface');
+        var lineColor = cssVar('--md-sys-color-outline-variant');
+        var primary = cssVar('--md-sys-color-primary');
 
         var nodes = new vis.DataSet(data.nodes.map(function (node) {
-            var color = '#e3f2fd'; // Default Person
-            var shape = 'dot';
-            var icon = null;
-
-            if (node.group === 'city') { color = '#e8f5e9'; shape = 'hexagon'; }
-            else if (node.group === 'education') { color = '#fff3e0'; shape = 'box'; }
-            else if (node.group === 'occupation') { color = '#f3e5f5'; shape = 'ellipse'; }
-            else if (node.group === 'religion') { color = '#fce4ec'; shape = 'diamond'; }
-            else if (node.group === 'caste') { color = '#e0f7fa'; shape = 'triangle'; }
-
+            var isPerson = node.type === 'Person';
+            var color = colorFor(isPerson ? (node.gender || 'Person') : node.type);
+            var tooltip = isPerson
+                ? [node.label, node.age ? node.age + ' yrs' : null, node.gender].filter(Boolean).join(' · ')
+                : node.type + ': ' + node.label;
             return {
                 id: node.id,
                 label: node.label,
-                title: node.title,
-                group: node.group,
-                color: { background: color, border: color },
-                font: { size: 14 }
+                title: tooltip,
+                shape: isPerson ? 'dot' : 'box',
+                size: isPerson ? 14 : undefined,
+                shapeProperties: { borderRadius: 8 },
+                color: { background: color, border: color, highlight: { background: color, border: primary } },
+                font: isPerson
+                    ? { size: 13, color: textColor, face: 'Roboto' }
+                    : { size: 11, color: '#fff', face: 'Roboto' },
+                isPerson: isPerson
             };
         }));
 
-        var edges = new vis.DataSet(data.edges);
+        var edges = new vis.DataSet(data.edges.map(function (edge, i) {
+            var similar = edge.type === 'SIMILAR_TO';
+            return {
+                id: i,
+                from: edge.source,
+                to: edge.target,
+                dashes: similar,
+                width: similar ? 2 : 1,
+                color: { color: similar ? primary : lineColor },
+                title: similar ? 'Shares ' + edge.shared + ' attributes' : edge.type
+            };
+        }));
 
-        var options = {
-            nodes: {
-                borderWidth: 1,
-                shadow: true
-            },
-            edges: {
-                width: 1,
-                color: { inherit: 'from' },
-                smooth: { type: 'continuous' }
-            },
-            physics: {
-                stabilization: false,
-                barnesHut: {
-                    gravitationalConstant: -2000,
-                    springConstant: 0.04,
-                    springLength: 95
-                }
-            },
-            groups: {
-                person: { shape: 'dot', color: '#e3f2fd' }
-            },
-            interaction: {
-                hover: true,
-                tooltipDelay: 200
-            }
-        };
-
-        var network = new vis.Network(container, { nodes: nodes, edges: edges }, options);
-
-        network.on("click", function (params) {
-            if (params.nodes.length > 0) {
-                var nodeId = params.nodes[0];
-                var node = nodes.get(nodeId);
-                if (node.group === 'person') {
-                    $scope.$apply(function () {
-                        $scope.viewBiodata(node.id); // Open modal on click
-                    });
-                }
+        var container = document.getElementById('network-container');
+        network = new vis.Network(container, { nodes: nodes, edges: edges }, {
+            physics: { stabilization: { iterations: 150 }, barnesHut: { gravitationalConstant: -3000, springLength: 120 } },
+            interaction: { hover: true, tooltipDelay: 150 }
+        });
+        network.on('click', function (params) {
+            if (!params.nodes.length) return;
+            var node = nodes.get(params.nodes[0]);
+            if (node.isPerson) {
+                $scope.$apply(function () { $scope.viewBiodata(node.id); });
             }
         });
-    };
+    }
 
     // ==================== HELPERS ====================
     $scope.getConfidenceClass = function (confidence) {
@@ -885,14 +635,49 @@ app.controller('MainController', ['$scope', '$http', '$timeout', function ($scop
         return 'low';
     };
 
-    $scope.getFileUrl = function (filePath) {
-        if (!filePath) return '#';
-        // Handle Windows and Unix separators
-        var filename = filePath.split(/[/\\]/).pop();
-        return '/files/' + filename;
+    $scope.fileUrl = function (biodata) {
+        return API_BASE + '/biodata/' + encodeURIComponent(biodata.id) + '/file';
     };
 
-    // Initialize
+    $scope.hasValue = function (value) {
+        return value !== null && value !== undefined && value !== '';
+    };
+
+    $scope.providerLabel = function () {
+        return { nvidia: 'Nemotron', vertexai: 'Gemini', anthropic: 'Claude' }[$scope.ocrProvider] || 'No OCR';
+    };
+
+    $scope.truthy = function (value) { return !!value; };
+    $scope.min = Math.min;
+
+    $scope.statusLabel = function (status) {
+        return STATUS_LABELS[status] || status;
+    };
+
+    $scope.initials = function (name) {
+        if (!name) return '?';
+        var parts = String(name).trim().split(/\s+/);
+        var letters = parts[0].charAt(0) + (parts.length > 1 ? parts[parts.length - 1].charAt(0) : '');
+        return letters.toUpperCase();
+    };
+
+    // ==================== THEME ====================
+    function effectiveDark() {
+        var forced = document.documentElement.getAttribute('data-theme');
+        if (forced) return forced === 'dark';
+        return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    }
+
+    $scope.isDark = effectiveDark();
+
+    $scope.toggleTheme = function () {
+        var next = effectiveDark() ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', next);
+        try { localStorage.setItem('biodata-theme', next); } catch (e) { }
+        $scope.isDark = next === 'dark';
+        if ($scope.currentPage === 'graph') $scope.loadGraph();
+    };
+
     $scope.init();
 }]);
 
@@ -900,47 +685,76 @@ app.controller('MainController', ['$scope', '$http', '$timeout', function ($scop
 // DIRECTIVES
 // ==============================================
 
-// Drag and Drop Directive
-app.directive('ngDragover', function () {
-    return function (scope, element, attrs) {
-        element.bind('dragover', function (event) {
-            event.preventDefault();
-            scope.$apply(function () {
-                scope.$eval(attrs.ngDragover, { $event: event });
+// <input type="file" file-change="handler(files)">
+app.directive('fileChange', function () {
+    return {
+        restrict: 'A',
+        link: function (scope, element, attrs) {
+            element.on('change', function (event) {
+                var files = event.target.files;
+                scope.$apply(function () {
+                    scope.$eval(attrs.fileChange, { files: files });
+                });
+                if (attrs.fileReset !== undefined) event.target.value = '';  // allow re-selecting the same file
             });
-        });
-    };
-});
-
-app.directive('ngDragleave', function () {
-    return function (scope, element, attrs) {
-        element.bind('dragleave', function (event) {
-            scope.$apply(function () {
-                scope.$eval(attrs.ngDragleave, { $event: event });
-            });
-        });
-    };
-});
-
-app.directive('ngDrop', function () {
-    return function (scope, element, attrs) {
-        element.bind('drop', function (event) {
-            event.preventDefault();
-            scope.$apply(function () {
-                scope.$eval(attrs.ngDrop, { $event: event });
-            });
-        });
-    };
-});
-
-// Array find polyfill for older browsers
-if (!Array.prototype.find) {
-    Array.prototype.find = function (predicate) {
-        for (var i = 0; i < this.length; i++) {
-            if (predicate(this[i], i, this)) {
-                return this[i];
-            }
         }
-        return undefined;
     };
-}
+});
+
+// Drag-and-drop events: drop-over="fn($event)", drop-leave="fn($event)", drop-files="fn($event)"
+['dropOver:dragover', 'dropLeave:dragleave', 'dropFiles:drop'].forEach(function (pair) {
+    var parts = pair.split(':');
+    app.directive(parts[0], function () {
+        return function (scope, element, attrs) {
+            element.on(parts[1], function (event) {
+                event.preventDefault();
+                scope.$apply(function () {
+                    scope.$eval(attrs[parts[0]], { $event: event });
+                });
+            });
+        };
+    });
+});
+
+// Elevate the top app bar once the page scrolls (M3 "on scroll" app bar)
+app.directive('scrollElevate', ['$window', function ($window) {
+    return function (scope, element) {
+        function update() {
+            element.toggleClass('scrolled', $window.pageYOffset > 4);
+        }
+        angular.element($window).on('scroll', update);
+        update();
+    };
+}]);
+
+// Material ripple from the pointer position on every state-layer element
+document.addEventListener('pointerdown', function (event) {
+    var target = event.target.closest && event.target.closest('.state-layer');
+    if (!target || target.disabled) return;
+    var rect = target.getBoundingClientRect();
+    var size = Math.max(rect.width, rect.height);
+    var ripple = document.createElement('span');
+    ripple.className = 'ripple';
+    ripple.style.width = ripple.style.height = size + 'px';
+    ripple.style.left = (event.clientX - rect.left - size / 2) + 'px';
+    ripple.style.top = (event.clientY - rect.top - size / 2) + 'px';
+    target.appendChild(ripple);
+    setTimeout(function () { ripple.remove(); }, 600);
+});
+
+// Close modals with Escape
+app.run(['$rootScope', '$document', function ($rootScope, $document) {
+    $document.on('keydown', function (event) {
+        if (event.key === 'Escape') {
+            $rootScope.$broadcast('escape');
+        }
+    });
+}]);
+
+app.directive('closeOnEscape', function () {
+    return function (scope, element, attrs) {
+        scope.$on('escape', function () {
+            scope.$apply(attrs.closeOnEscape);
+        });
+    };
+});

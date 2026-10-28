@@ -1,332 +1,141 @@
 """
-Similarity Service - PKL-based similarity search for match finding.
-Follows Single Responsibility Principle.
-Optimized with in-memory caching and indexed feature lookups.
+Similarity Service - weighted attribute matching for finding compatible profiles.
 """
-import pickle
-import os
-import re
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
-import math
-import threading
+import heapq
+from typing import List, Optional, Tuple
 
-from backend.config import settings
-from backend.models import BiodataInDB, SearchPreferences, MatchResult
+from backend.models import BiodataInDB, Gender, MatchResult, SearchPreferences
+
+# Relative importance of each criterion. Scores are normalized over the
+# criteria actually supplied, so a search on one field can still reach 100%.
+WEIGHTS = {
+    "age": 0.15,
+    "gender": 0.20,
+    "religion": 0.15,
+    "caste": 0.10,
+    "education": 0.15,
+    "occupation": 0.10,
+    "location": 0.10,
+    "marital_status": 0.05,
+}
+
+
+def _fuzzy_match(query: Optional[str], target: Optional[str]) -> bool:
+    """Case-insensitive containment match in either direction."""
+    if not query or not target:
+        return False
+    q, t = query.lower().strip(), target.lower().strip()
+    return bool(q and t) and (q in t or t in q)
 
 
 class SimilarityService:
-    """
-    Service for finding matching biodatas based on preferences.
-    Uses pickle file with in-memory caching for fast lookups.
-    """
+    """Scores biodatas against search preferences."""
 
-    def __init__(self, pkl_path: Optional[Path] = None):
-        self.pkl_path = pkl_path or settings.PKL_FILE_PATH
-        self._lock = threading.Lock()
-        # In-memory cache
-        self._cache: Optional[Dict[str, Any]] = None
-        self._cache_valid = False
-        self._ensure_pkl_exists()
-
-    def _ensure_pkl_exists(self):
-        """Create pickle file if it doesn't exist."""
-        self.pkl_path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.pkl_path.exists():
-            self._save_data({"features": {}, "metadata": {"version": "1.0", "updated_at": datetime.utcnow().isoformat()}})
-
-    def _load_data(self) -> Dict[str, Any]:
-        """Load data from pickle file with caching."""
-        if self._cache_valid and self._cache is not None:
-            return self._cache
-        try:
-            with open(self.pkl_path, "rb") as f:
-                self._cache = pickle.load(f)
-                self._cache_valid = True
-                return self._cache
-        except (pickle.PickleError, FileNotFoundError):
-            self._cache = {"features": {}, "metadata": {"version": "1.0"}}
-            self._cache_valid = True
-            return self._cache
-
-    def _save_data(self, data: Dict[str, Any]):
-        """Save data to pickle file and update cache."""
-        data["metadata"]["updated_at"] = datetime.utcnow().isoformat()
-        with open(self.pkl_path, "wb") as f:
-            pickle.dump(data, f)
-        self._cache = data
-        self._cache_valid = True
-
-    def _extract_features(self, biodata: BiodataInDB) -> Dict[str, Any]:
-        """
-        Extract searchable features from biodata.
-
-        Args:
-            biodata: BiodataInDB instance
-
-        Returns:
-            Dictionary of normalized features
-        """
-        features = {
-            "id": biodata.id,
-            "age": biodata.age,
-            "gender": biodata.gender.value if biodata.gender else None,
-            "religion": self._normalize_string(biodata.religion),
-            "caste": self._normalize_string(biodata.caste),
-            "education": self._normalize_string(biodata.education),
-            "occupation": self._normalize_string(biodata.occupation),
-            "location": self._normalize_string(
-                f"{biodata.current_city or ''} {biodata.state or ''} {biodata.country or ''}"
-            ),
-            "marital_status": biodata.marital_status.value if biodata.marital_status else None,
-            "income": self._parse_income(biodata.income),
-            "height": self._parse_height(biodata.height),
-        }
-        return features
-
-    def _normalize_string(self, s: Optional[str]) -> Optional[str]:
-        """Normalize string for comparison."""
-        if not s:
-            return None
-        return s.lower().strip()
-
-    def _parse_income(self, income_str: Optional[str]) -> Optional[float]:
-        """Parse income string to numeric value (in lakhs)."""
-        if not income_str:
-            return None
-        try:
-            # Extract numbers from string
-            numbers = re.findall(r"[\d.]+", income_str)
-            if numbers:
-                value = float(numbers[0])
-                # Convert to lakhs if in different format
-                if "crore" in income_str.lower():
-                    value *= 100
-                elif "k" in income_str.lower():
-                    value /= 100
-                return value
-        except (ValueError, IndexError):
-            pass
-        return None
-
-    def _parse_height(self, height_str: Optional[str]) -> Optional[float]:
-        """Parse height string to cm."""
-        if not height_str:
-            return None
-        try:
-            # Handle feet/inches format
-            if "'" in height_str or "ft" in height_str.lower():
-                parts = re.findall(r"(\d+)", height_str)
-                if len(parts) >= 1:
-                    feet = int(parts[0])
-                    inches = int(parts[1]) if len(parts) > 1 else 0
-                    return (feet * 30.48) + (inches * 2.54)
-            # Handle cm format
-            numbers = re.findall(r"[\d.]+", height_str)
-            if numbers:
-                return float(numbers[0])
-        except (ValueError, IndexError):
-            pass
-        return None
-
-    async def index_biodata(self, biodata: BiodataInDB):
-        """
-        Add or update biodata in the similarity index.
-        Uses in-memory cache to avoid repeated disk reads.
-
-        Args:
-            biodata: BiodataInDB to index
-        """
-        with self._lock:
-            data = self._load_data()
-            features = self._extract_features(biodata)
-            data["features"][biodata.id] = features
-            self._save_data(data)
-
-    async def remove_from_index(self, biodata_id: str):
-        """Remove biodata from similarity index."""
-        with self._lock:
-            data = self._load_data()
-            if biodata_id in data["features"]:
-                del data["features"][biodata_id]
-                self._save_data(data)
+    def has_criteria(self, preferences: SearchPreferences) -> bool:
+        return any(v not in (None, "") for v in preferences.model_dump().values())
 
     async def find_matches(
         self,
         preferences: SearchPreferences,
         biodatas: List[BiodataInDB],
-        limit: int = 10
+        limit: int = 10,
     ) -> List[MatchResult]:
-        """
-        Find matching biodatas based on preferences.
-        Uses heap-based top-k algorithm for O(n log k) instead of O(n log n).
-
-        Args:
-            preferences: Search preferences
-            biodatas: List of biodatas to search through
-            limit: Maximum number of results
-
-        Returns:
-            List of MatchResult sorted by similarity score
-        """
-        import heapq
-
-        # Use min-heap to maintain top-k results (more efficient than full sort)
-        # Heap stores (score, index, biodata, reasons) - index for stable comparison
+        """Return the top `limit` biodatas by match score (O(n log k))."""
         heap: List[Tuple[float, int, BiodataInDB, List[str]]] = []
-
         for idx, biodata in enumerate(biodatas):
-            score, reasons = self._calculate_match_score(preferences, biodata)
-            if score > 0:
-                if len(heap) < limit:
-                    heapq.heappush(heap, (score, idx, biodata, reasons))
-                elif score > heap[0][0]:
-                    heapq.heapreplace(heap, (score, idx, biodata, reasons))
+            score, reasons = self.calculate_match_score(preferences, biodata)
+            if score <= 0:
+                continue
+            entry = (score, -idx, biodata, reasons)  # -idx keeps earlier items on ties
+            if len(heap) < limit:
+                heapq.heappush(heap, entry)
+            elif entry[:2] > heap[0][:2]:
+                heapq.heapreplace(heap, entry)
 
-        # Extract results in descending order
-        results = []
-        while heap:
-            score, _, biodata, reasons = heapq.heappop(heap)
-            results.append(MatchResult(
-                biodata=biodata,
-                similarity_score=score,
-                match_reasons=reasons
-            ))
-        results.reverse()  # Highest score first
-
-        return results
+        ranked = sorted(heap, key=lambda e: e[:2], reverse=True)
+        return [
+            MatchResult(biodata=b, similarity_score=round(score, 4), match_reasons=reasons)
+            for score, _, b, reasons in ranked
+        ]
 
     async def find_similar_profiles(
         self,
         source_biodata: BiodataInDB,
         biodatas: List[BiodataInDB],
-        limit: int = 10
+        limit: int = 10,
     ) -> List[MatchResult]:
-        """
-        Find profiles similar to a given biodata.
-
-        Args:
-            source_biodata: Source biodata to match against
-            biodatas: List of biodatas to search through
-            limit: Maximum number of results
-
-        Returns:
-            List of similar profiles
-        """
-        # Convert source biodata to preferences
-        gender_pref = None
-        if source_biodata.gender:
-            # Opposite gender preference
-            gender_pref = "female" if source_biodata.gender.value == "male" else "male"
-
+        """Find compatible profiles for a given biodata (opposite gender, similar age/community)."""
+        opposite = {Gender.MALE: Gender.FEMALE, Gender.FEMALE: Gender.MALE}
         preferences = SearchPreferences(
-            gender=gender_pref,
+            gender=opposite.get(source_biodata.gender),
             religion=source_biodata.religion,
             caste=source_biodata.caste,
             min_age=source_biodata.age - 5 if source_biodata.age else None,
             max_age=source_biodata.age + 5 if source_biodata.age else None,
         )
+        # Gender is a hard filter here, not just a weighted criterion: a same-gender
+        # profile must never surface just because the age happens to fit.
+        candidates = [
+            b for b in biodatas
+            if b.id != source_biodata.id
+            and not (preferences.gender and b.gender and b.gender != preferences.gender)
+        ]
+        return await self.find_matches(preferences, candidates, limit)
 
-        # Filter out the source biodata itself
-        filtered_biodatas = [b for b in biodatas if b.id != source_biodata.id]
-
-        return await self.find_matches(preferences, filtered_biodatas, limit)
-
-    def _calculate_match_score(
+    def calculate_match_score(
         self,
         preferences: SearchPreferences,
-        biodata: BiodataInDB
+        biodata: BiodataInDB,
     ) -> Tuple[float, List[str]]:
-        """
-        Calculate match score between preferences and biodata.
-
-        Args:
-            preferences: Search preferences
-            biodata: Biodata to score
-
-        Returns:
-            Tuple of (score 0-1, list of match reasons)
-        """
+        """Return (score in 0..1, human-readable match reasons)."""
         score = 0.0
         max_score = 0.0
-        reasons = []
+        reasons: List[str] = []
 
-        # Age matching (weight: 0.15)
+        def check(key: str, matched: bool, reason: str):
+            nonlocal score, max_score
+            max_score += WEIGHTS[key]
+            if matched:
+                score += WEIGHTS[key]
+                reasons.append(reason)
+
         if preferences.min_age is not None or preferences.max_age is not None:
-            max_score += 0.15
-            if biodata.age:
-                age_match = True
-                if preferences.min_age and biodata.age < preferences.min_age:
-                    age_match = False
-                if preferences.max_age and biodata.age > preferences.max_age:
-                    age_match = False
-                if age_match:
-                    score += 0.15
-                    reasons.append(f"Age: {biodata.age} years")
+            age = biodata.age
+            in_range = (
+                age is not None
+                and (preferences.min_age is None or age >= preferences.min_age)
+                and (preferences.max_age is None or age <= preferences.max_age)
+            )
+            check("age", in_range, f"Age: {age} years")
 
-        # Gender matching (weight: 0.2)
         if preferences.gender:
-            max_score += 0.2
-            if biodata.gender and biodata.gender.value == preferences.gender:
-                score += 0.2
-                reasons.append(f"Gender: {biodata.gender.value}")
+            check("gender", biodata.gender == preferences.gender,
+                  f"Gender: {biodata.gender.value if biodata.gender else ''}")
 
-        # Religion matching (weight: 0.15)
         if preferences.religion:
-            max_score += 0.15
-            if biodata.religion and self._fuzzy_match(preferences.religion, biodata.religion):
-                score += 0.15
-                reasons.append(f"Religion: {biodata.religion}")
+            check("religion", _fuzzy_match(preferences.religion, biodata.religion), f"Religion: {biodata.religion}")
 
-        # Caste matching (weight: 0.1)
         if preferences.caste:
-            max_score += 0.1
-            if biodata.caste and self._fuzzy_match(preferences.caste, biodata.caste):
-                score += 0.1
-                reasons.append(f"Caste: {biodata.caste}")
+            check("caste", _fuzzy_match(preferences.caste, biodata.caste), f"Caste: {biodata.caste}")
 
-        # Education matching (weight: 0.15)
         if preferences.education:
-            max_score += 0.15
-            if biodata.education and self._fuzzy_match(preferences.education, biodata.education):
-                score += 0.15
-                reasons.append(f"Education: {biodata.education}")
+            check("education", _fuzzy_match(preferences.education, biodata.education),
+                  f"Education: {biodata.education}")
 
-        # Occupation matching (weight: 0.1)
         if preferences.occupation:
-            max_score += 0.1
-            if biodata.occupation and self._fuzzy_match(preferences.occupation, biodata.occupation):
-                score += 0.1
-                reasons.append(f"Occupation: {biodata.occupation}")
+            check("occupation", _fuzzy_match(preferences.occupation, biodata.occupation),
+                  f"Occupation: {biodata.occupation}")
 
-        # Location matching (weight: 0.1)
         if preferences.location:
-            max_score += 0.1
-            location_str = f"{biodata.current_city or ''} {biodata.state or ''}"
-            if self._fuzzy_match(preferences.location, location_str):
-                score += 0.1
-                reasons.append(f"Location: {biodata.current_city or biodata.state}")
+            places = [biodata.current_city, biodata.state, biodata.native_place, biodata.country]
+            hit = next((p for p in places if _fuzzy_match(preferences.location, p)), None)
+            check("location", hit is not None, f"Location: {hit}")
 
-        # Marital status matching (weight: 0.05)
         if preferences.marital_status:
-            max_score += 0.05
-            if biodata.marital_status and biodata.marital_status == preferences.marital_status:
-                score += 0.05
-                reasons.append(f"Marital Status: {biodata.marital_status.value}")
+            check("marital_status", biodata.marital_status == preferences.marital_status,
+                  f"Marital Status: {preferences.marital_status.value}")
 
-        # Normalize score
-        final_score = score / max_score if max_score > 0 else 0.0
-
-        return final_score, reasons
-
-    def _fuzzy_match(self, query: str, target: str) -> bool:
-        """Simple fuzzy string matching."""
-        if not query or not target:
-            return False
-        query_lower = query.lower().strip()
-        target_lower = target.lower().strip()
-        return query_lower in target_lower or target_lower in query_lower
+        return (score / max_score if max_score > 0 else 0.0), reasons
 
 
 # Singleton instance

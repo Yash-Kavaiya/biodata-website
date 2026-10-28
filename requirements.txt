@@ -1,25 +1,22 @@
-# Biodata Management System - Dependencies
+# Biodata Management System - Runtime dependencies
 
-# Web Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
+# Web framework
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
 
-# Data Validation
-pydantic==2.5.3
-pydantic-settings==2.1.0
+# Settings & validation
+pydantic>=2.7,<3
+pydantic-settings>=2.3
 
-# HTTP Client (for LLM API calls)
-httpx==0.26.0
+# HTTP client (Anthropic provider)
+httpx>=0.27
 
-# File handling
-python-multipart==0.0.6
-aiofiles==23.2.1
+# PDF rendering / text-layer extraction (NVIDIA provider)
+pymupdf>=1.24
 
-# Development
-python-dotenv==1.0.0
+# Google Gen AI SDK (Gemini on Vertex AI)
+google-genai>=1.0
 
-# Google Vertex AI SDK
-google-cloud-aiplatform>=1.45.0
-
-# Neo4j Graph Database
-neo4j~=5.28.0
+# Neo4j graph database (optional at runtime)
+neo4j>=5.20,<6
